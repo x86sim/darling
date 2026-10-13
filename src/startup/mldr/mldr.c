@@ -807,7 +807,8 @@ int __mldr_create_process_lifetime_pipe(int* fds) {
 		return 0;
 	}
 
-	int pre_fds[2];
+	int pre_fds[2] = { -1, -1 };
+	fds[0] = fds[1] = -1;
 	if (pipe(pre_fds) == -1) {
 		goto err_out;
 	}
