@@ -4260,7 +4260,7 @@ jobmgr_reap_bulk(jobmgr_t jm, struct kevent *kev)
 }
 
 #ifdef DARLING
-// x86Code: launchd as the container's pid 1 reaps stray zombies. XNU reaps an orphan itself once it is reparented to
+// x86Sim: launchd as the container's pid 1 reaps stray zombies. XNU reaps an orphan itself once it is reparented to
 // initproc (P_LIST_DEADPARENT: reap_child_locked in proc_exit), so launchd only ever waits for its jobs. On Linux the
 // orphan is reparented to the pid namespace's init (this launchd) and stays a zombie until init waits for it: when a
 // launchd_sim died (or was SIGKILLed by boot-a64.sh's stop_prefix), every process it had started was reparented here,

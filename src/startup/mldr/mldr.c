@@ -108,7 +108,7 @@ static int kernel_major = -1;
 static int kernel_minor = -1;
 
 #ifdef __x86_64__
-// x86Code: the iOS simulator's dyld shared cache. dyld_sim maps it privately with MAP_FIXED at the addresses the cache
+// x86Sim: the iOS simulator's dyld shared cache. dyld_sim maps it privately with MAP_FIXED at the addresses the cache
 // was built for (x86_64: SHARED_REGION_BASE_X86_64 0x7FF800000000, 6 subcaches, 24 GB, no slide info), so it can't
 // move and every process maps the same file pages at the same addresses (clean pages stay shared in the page cache).
 // On macOS that range is the shared region and nothing else lives there; on Linux it is where the kernel puts a
@@ -131,7 +131,7 @@ static void reserve_sim_shared_region(char** argv, char** envp)
 			break;
 		}
 	}
-	if (found == NULL || getenv("X86CODE_NO_SHARED_REGION") != NULL)
+	if (found == NULL || getenv("X86SIM_NO_SHARED_REGION") != NULL)
 		return;
 
 	void* p = mmap((void*) SIM_SHARED_REGION_BASE, SIM_SHARED_REGION_SIZE, PROT_NONE,
@@ -154,12 +154,12 @@ static void reserve_sim_shared_region(char** argv, char** envp)
 #endif
 
 #ifdef __x86_64__
-// x86Code (arm64 plan, stage 1): Apple's arm64-only iOS-simulator binaries (iOS 27 runtime) run under a JIT. For an
+// x86Sim (arm64 plan, stage 1): Apple's arm64-only iOS-simulator binaries (iOS 27 runtime) run under a JIT. For an
 // arm64-only Mach-O, mldr re-executes itself on host/arm64host (an x86_64 macOS program installed next to mldr), which
 // starts like any Darling process and then runs the arm64 program in libarm64jit.so (dynarmic). DYLD_* variables are
-// renamed X86CODE_A64_DYLD_* so Darling's dyld doesn't act on them; libarm64jit gives them back to dyld_sim.
-// X86CODE_A64_EXE is the arm64 program (Darwin path); libsystem_kernel keys simulator behaviour on it.
-#define X86CODE_A64_SYSTEM_ROOT "/Volumes/SystemRoot"
+// renamed X86SIM_A64_DYLD_* so Darling's dyld doesn't act on them; libarm64jit gives them back to dyld_sim.
+// X86SIM_A64_EXE is the arm64 program (Darwin path); libsystem_kernel keys simulator behaviour on it.
+#define X86SIM_A64_SYSTEM_ROOT "/Volumes/SystemRoot"
 
 static bool is_arm64_only(const char* path)
 {
@@ -213,7 +213,7 @@ static void arm64_reexec(const char* filename, char** argv, char** envp, struct 
 	if (lr->root_path && strncmp(filename, lr->root_path, lr->root_path_length) == 0)
 		snprintf(darwin_path, sizeof(darwin_path), "%s", filename + lr->root_path_length);
 	else if (lr->root_path)
-		snprintf(darwin_path, sizeof(darwin_path), X86CODE_A64_SYSTEM_ROOT "%s", filename);
+		snprintf(darwin_path, sizeof(darwin_path), X86SIM_A64_SYSTEM_ROOT "%s", filename);
 	else
 		snprintf(darwin_path, sizeof(darwin_path), "%s", filename);
 
@@ -223,21 +223,21 @@ static void arm64_reexec(const char* filename, char** argv, char** envp, struct 
 	char** nenv = malloc((envc + 3) * sizeof(char*));
 	size_t k = 0;
 	for (size_t i = 0; i < envc; i++) {
-		if (strncmp(envp[i], "X86CODE_A64_EXE=", 16) == 0 || strncmp(envp[i], "X86CODE_A64_JIT=", 16) == 0)
+		if (strncmp(envp[i], "X86SIM_A64_EXE=", sizeof("X86SIM_A64_EXE=") - 1) == 0 || strncmp(envp[i], "X86SIM_A64_JIT=", sizeof("X86SIM_A64_JIT=") - 1) == 0)
 			continue;
 		if (strncmp(envp[i], "DYLD_", 5) == 0) {
-			char* r = malloc(strlen(envp[i]) + 13);
-			strcpy(r, "X86CODE_A64_");
+			char* r = malloc(strlen(envp[i]) + sizeof("X86SIM_A64_"));
+			strcpy(r, "X86SIM_A64_");
 			strcat(r, envp[i]);
 			nenv[k++] = r;
 		} else
 			nenv[k++] = envp[i];
 	}
-	nenv[k] = malloc(strlen(darwin_path) + 17);
-	strcpy(nenv[k], "X86CODE_A64_EXE=");
+	nenv[k] = malloc(strlen(darwin_path) + sizeof("X86SIM_A64_EXE="));
+	strcpy(nenv[k], "X86SIM_A64_EXE=");
 	strcat(nenv[k++], darwin_path);
-	nenv[k] = malloc(strlen(jit) + 17);
-	strcpy(nenv[k], "X86CODE_A64_JIT=");
+	nenv[k] = malloc(strlen(jit) + sizeof("X86SIM_A64_JIT="));
+	strcpy(nenv[k], "X86SIM_A64_JIT=");
 	strcat(nenv[k++], jit);
 	nenv[k] = NULL;
 
@@ -265,15 +265,15 @@ static void arm64_reexec(const char* filename, char** argv, char** envp, struct 
 static const char* arm64_host_setup(struct load_results* lr)
 {
 	static char linux_path[8192];
-	const char* exe = getenv("X86CODE_A64_EXE");
+	const char* exe = getenv("X86SIM_A64_EXE");
 	if (exe == NULL)
 		return NULL;
 	mmap((void*) 0x1C0000000ULL, 0x100000000ULL, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE, -1, 0);
 	// the re-exec through /proc/self/exe named the Linux task "exe" (launchd's logs, proc_name): use the program's name
 	const char* base = strrchr(exe, '/');
 	prctl(PR_SET_NAME, base ? base + 1 : exe, 0, 0, 0);
-	if (strncmp(exe, X86CODE_A64_SYSTEM_ROOT "/", sizeof(X86CODE_A64_SYSTEM_ROOT)) == 0)
-		snprintf(linux_path, sizeof(linux_path), "%s", exe + sizeof(X86CODE_A64_SYSTEM_ROOT) - 1);
+	if (strncmp(exe, X86SIM_A64_SYSTEM_ROOT "/", sizeof(X86SIM_A64_SYSTEM_ROOT)) == 0)
+		snprintf(linux_path, sizeof(linux_path), "%s", exe + sizeof(X86SIM_A64_SYSTEM_ROOT) - 1);
 	else if (lr->root_path)
 		snprintf(linux_path, sizeof(linux_path), "%s%s", lr->root_path, exe);
 	else
@@ -291,7 +291,7 @@ int main(int argc, char** argv, char** envp)
 	size_t orig_argv0_len = 0;
 	const char* orig_argv1 = NULL;
 
-	// x86Code: no transparent huge pages for Darling processes (inherited across fork/exec; arm64 guests already set
+	// x86Sim: no transparent huge pages for Darling processes (inherited across fork/exec; arm64 guests already set
 	// it in libarm64jit's host.cpp). With the host's THP "always", the x86_64 daemons' sparse malloc/libdispatch
 	// regions were backed by 2 MB pages: iokitd ~66 of its ~70 MB PSS was AnonHugePages for a few KB actually used.
 	prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
