@@ -261,7 +261,7 @@ static void arm64_reexec(const char* filename, char** argv, char** envp, struct 
 	exit(1);
 }
 
-// In the re-executed arm64host: keep the arm64 shared cache's fixed range (0x1C0000000, ~3 GB) free for dyld_sim, and
+// In the re-executed arm64host: keep the arm64 shared cache's fixed range (0x1C0000000, 4 GB) free for dyld_sim, and
 // tell darlingserver the arm64 program is the executable (proc_pidpath, the process's platform).
 static const char* arm64_host_setup(struct load_results* lr)
 {
