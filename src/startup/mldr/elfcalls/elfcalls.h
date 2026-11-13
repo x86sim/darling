@@ -71,6 +71,13 @@ struct elf_calls
 	int (*dserver_get_process_lifetime_pipe)(void);
 	int (*dserver_process_lifetime_pipe_refresh)(void);
 	void (*dserver_close_process_lifetime_pipe)(int fd);
+
+	// x86Sim (2026-11-13): first thing in a fork's child (sys_fork, before guard_table_postfork_child closes the
+	// parent's descriptors through mldr's socket bitmap): mldr's locks as fresh ones. The fork is the raw syscall
+	// (glibc's fork() needs glibc's thread pointer, which Darling threads do not keep: Darling hung at boot with it),
+	// so a lock another thread of the parent held at the fork stayed held in the child: launchd_sim's spawn
+	// children hung in socket_bitmap_put (a boot stuck black, every process idle).
+	void (*postfork_child)(void);
 };
 
 #endif

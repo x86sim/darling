@@ -746,6 +746,14 @@ static socket_bitmap_t socket_bitmap = {
 	.highest = -1,
 };
 
+// x86Sim (2026-11-13): in a fork's child (one thread), the bitmap's mutex as a fresh one (elfcalls postfork_child,
+// first thing in sys_fork's child). Another thread of the parent may have held it at the fork (each new thread takes
+// it for its RPC socket); the child closes the parent's descriptors through it (socket_bitmap_put) and waited on it
+// forever. Linux fork keeps a locked mutex locked and the raw fork syscall runs no pthread_atfork handlers.
+void __mldr_socket_bitmap_postfork_child(void) {
+	pthread_mutex_init(&socket_bitmap.mutex, NULL);
+}
+
 int __mldr_create_rpc_socket(void) {
 	int pre_fd = -1;
 	int fd = -1;
