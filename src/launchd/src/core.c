@@ -4332,6 +4332,10 @@ darling_reap_strays(void)
 		}
 	}
 	closedir(d);
+}
+#endif
+
+#ifdef DARLING
 void
 jobmgr_reap_orphans(void)
 {

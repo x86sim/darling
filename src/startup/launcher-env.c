@@ -104,6 +104,29 @@ static bool serverMayGet(const char* entry)
 	return false;
 }
 
+// x86Sim: the server's environment is also the container's (launchd and every daemon it starts inherit it), and the
+// simulator stack configures itself through it: the X86SIM_*, A64_*, SIMULATOR_*, SIMFB_* and SIMHID_* settings, DPREFIX
+// (how cli/libexec/arm64/boot-a64.sh finds a container's processes), and darlingserver's own x86Sim knobs. None of these
+// names is read by the host's dynamic loader or a shell, so the setuid launcher passes them on too.
+static bool x86simServerMayGet(const char* entry)
+{
+	static const char* const prefixes[] = { "X86SIM_", "A64_", "SIMULATOR_", "SIMFB_", "SIMHID_" };
+	static const char* const names[] = { "DPREFIX", "DSERVER_INLINE", "DSERVER_NICE", "DSERVER_LOG_CATEGORIES" };
+
+	for (size_t i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); i++)
+	{
+		size_t len = strlen(prefixes[i]);
+		if (strncmp(entry, prefixes[i], len) == 0 && entry[len] != '\0' && entry[len] != '=' && strchr(entry, '=') != NULL)
+			return true;
+	}
+	for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++)
+	{
+		if (launcherEnvEntryIs(entry, names[i]))
+			return true;
+	}
+	return false;
+}
+
 char** launcherServerEnvironment(char* const* envp, bool restricted)
 {
 	size_t count = 0, n = 0;
@@ -122,7 +145,7 @@ char** launcherServerEnvironment(char* const* envp, bool restricted)
 
 	for (size_t i = 0; i < count; i++)
 	{
-		if (restricted ? serverMayGet(envp[i]) : launcherGuestMayGet(envp[i]))
+		if (restricted ? (serverMayGet(envp[i]) || x86simServerMayGet(envp[i])) : launcherGuestMayGet(envp[i]))
 			result[n++] = envp[i];
 	}
 	result[n] = NULL;
