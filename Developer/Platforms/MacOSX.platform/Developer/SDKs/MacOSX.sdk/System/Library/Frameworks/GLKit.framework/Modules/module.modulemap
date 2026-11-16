@@ -1,0 +1,5 @@
+framework module GLKit [extern_c] [system] {
+  umbrella header "GLKit.h"
+  export *
+  module * { export * }
+}

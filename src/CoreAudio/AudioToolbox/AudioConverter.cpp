@@ -19,6 +19,7 @@ along with Darling.  If not, see <http://www.gnu.org/licenses/>.
 
 #include "AudioConverter.h"
 #include "AudioConverterImpl.h"
+#include "PCMConverter.h"
 #include <CarbonCore/MacErrors.h>
 #include <stdexcept>
 #include <cstring>
@@ -28,7 +29,7 @@ OSStatus AudioConverterNew(const AudioStreamBasicDescription* inSourceFormat, co
 	return AudioConverter::create(inSourceFormat, inDestinationFormat, (AudioConverter**)outAudioConverter);
 }
 
-OSStatus AudioConverterNewSpecific(const AudioStreamBasicDescription* inSourceFormat, const AudioStreamBasicDescription* inDestinationFormat, UInt32 inNumberClassDescriptions, AudioClassDescription* nClassDescriptions, AudioConverterRef* outAudioConverter)
+OSStatus AudioConverterNewSpecific(const AudioStreamBasicDescription* inSourceFormat, const AudioStreamBasicDescription* inDestinationFormat, UInt32 inNumberClassDescriptions, const AudioClassDescription* nClassDescriptions, AudioConverterRef* outAudioConverter)
 {
 	// FIXME
 	return AudioConverterNew(inSourceFormat, inDestinationFormat, outAudioConverter);
@@ -71,6 +72,12 @@ OSStatus AudioConverterConvertBuffer(AudioConverterRef inAudioConverter, UInt32 
 	AudioBufferList in, out;
 	OSStatus stat;
 
+	if (!inAudioConverter)
+		return paramErr;
+
+	if (PCMConverter* pcm = ((AudioConverter*)inAudioConverter)->nativeConverter())
+		return pcm->convertBuffer(inInputDataSize, inInputData, ioOutputDataSize, outOutputData);
+
 	in.mNumberBuffers = out.mNumberBuffers = 1;
 
 	in.mBuffers[0].mNumberChannels = 2;
@@ -98,6 +105,13 @@ OSStatus AudioConverterConvertComplexBuffer(AudioConverterRef inAudioConverter, 
 	OSStatus status;
 	UInt32 dataPacketSize;
 	int64_t totalOutBytes = 0;
+
+	if (!inAudioConverter)
+		return paramErr;
+
+	if (PCMConverter* pcm = ((AudioConverter*)inAudioConverter)->nativeConverter())
+		return pcm->convertComplexBuffer(inNumberPCMFrames, inInputData, outOutputData);
+
 	typedef OSStatus (^CallbackBlock)(AudioConverterRef audioConverter, UInt32* numberDataPackets, AudioBufferList* data, AudioStreamPacketDescription** dataPacketDescription);
 	
 	CallbackBlock callbackBlock =

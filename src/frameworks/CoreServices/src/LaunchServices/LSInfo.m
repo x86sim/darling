@@ -20,7 +20,13 @@ along with Darling.  If not, see <http://www.gnu.org/licenses/>.
 
 #include <LaunchServices/LaunchServices.h>
 #include <CarbonCore/MacErrors.h>
+#include "LSHostOpen.h"
+#include <errno.h>
 #include <stdio.h>
+#include <string.h>
+#include <limits.h>
+#include <unistd.h>
+#include <sys/stat.h>
 #include <sqlite3.h>
 #import <Foundation/NSString.h>
 #import <fmdb/FMDatabaseQueue.h>
@@ -51,6 +57,13 @@ static NSString* fourcc(UInt32 code)
 	CFRelease(str);
 
 	return rv;
+}
+
+// Registrations of bundles that were removed stay in the database. Like macOS, the lookups below
+// skip an application whose bundle is no longer on disk.
+static BOOL bundleIsPresent(NSString* path)
+{
+	return path != nil && access([path fileSystemRepresentation], F_OK) == 0;
 }
 
 OSStatus
@@ -84,18 +97,20 @@ LSFindApplicationForInfo(
 			query = [query stringByAppendingFormat:@" and path like '%%%@'", escape((NSString*) inName)];
 		
 		FMResultSet* rs = [db executeQuery:query];
-		if ([rs next])
+		retval = kLSApplicationNotFoundErr;
+		while ([rs next])
 		{
 			NSString* path = [rs stringForColumn:@"path"];
+			if (!bundleIsPresent(path))
+				continue;
 			if (outAppURL)
 				*outAppURL = (CFURLRef) [[NSURL alloc] initFileURLWithPath:path isDirectory:YES];
 			if (outAppRef)
 				FSPathMakeRef((const UInt8*) [path fileSystemRepresentation], outAppRef, NULL);
 
 			retval = noErr;
+			break;
 		}
-		else
-			retval = kLSApplicationNotFoundErr;
 		[rs close];
 	}];
 
@@ -106,7 +121,7 @@ CFArrayRef LSCopyApplicationURLsForBundleIdentifier(CFStringRef inBundleIdentifi
 {
 	if (!inBundleIdentifier)
 	{
-		if (*outError)
+		if (outError)
 			*outError = CFErrorCreate(NULL, kCFErrorDomainOSStatus, paramErr, NULL);
 		return NULL;
 	}
@@ -116,7 +131,7 @@ CFArrayRef LSCopyApplicationURLsForBundleIdentifier(CFStringRef inBundleIdentifi
 
 	if (dq == nil)
 	{
-		if (*outError)
+		if (outError)
 			*outError = CFErrorCreate(NULL, kCFErrorDomainOSStatus, fnfErr, NULL);
 		return NULL;
 	}
@@ -124,21 +139,22 @@ CFArrayRef LSCopyApplicationURLsForBundleIdentifier(CFStringRef inBundleIdentifi
 	[dq inDatabase:^(FMDatabase* db) {
 		FMResultSet* rs = [db executeQuery:@"select path from bundle where package_type='APPL' and bundle_id = ?", inBundleIdentifier];
 
-		if ([rs next])
+		NSMutableArray* mut = [[NSMutableArray alloc] init];
+		while ([rs next])
 		{
-			NSMutableArray* mut = [[NSMutableArray alloc] init];
-			do
-			{
-				[mut addObject: [NSURL fileURLWithPath: [rs stringForColumn:@"path"] isDirectory: YES]];
-			}
-			while ([rs next]);
+			NSString* path = [rs stringForColumn:@"path"];
+			if (bundleIsPresent(path))
+				[mut addObject: [NSURL fileURLWithPath: path isDirectory: YES]];
+		}
 
+		if ([mut count] > 0)
+		{
 			retval = (CFArrayRef) [[NSArray alloc] initWithArray: mut];
 			[mut release];
 		}
 		else
 		{
-			if (*outError)
+			if (outError)
 				*outError = CFErrorCreate(NULL, kCFErrorDomainOSStatus, kLSApplicationNotFoundErr, NULL);
 			retval = NULL;
 		}
@@ -199,7 +215,7 @@ LSGetApplicationForInfo(
 		if (inExtension != NULL)
 		{
 			NSString* escaped = escape((NSString*) inExtension);
-			query = [query stringByAppendingFormat:@" and (EXISTS (SELECT * FROM app_doc_extension AE WHERE AE.doc=AD.class AND AE.extension = '%@')"
+			query = [query stringByAppendingFormat:@" and (EXISTS (SELECT * FROM app_doc_extension AE WHERE AE.doc=AD.id AND AE.extension = '%@')"
 							@" OR "
 					@"EXISTS (SELECT * FROM app_doc_uti AU JOIN uti ON uti.type_identifier = AU.uti JOIN uti_tag UT ON UT.uti=uti.id WHERE AU.doc=AD.id AND UT.tag = 'public.filename-extension' AND UT.value='%@'))",
 					escaped, escaped];
@@ -211,7 +227,7 @@ LSGetApplicationForInfo(
 			query = [query stringByAppendingFormat:@" and creator='%@'", fourcc(inCreator)];
 		if (inRoleMask != kLSRolesAll)
 		{
-			query = [query stringByAppendingFormat:@" and id IN (SELECT A.bundle FROM app_doc WHERE role IN (%@))", roleSQLArray(inRoleMask)];
+			query = [query stringByAppendingFormat:@" and AD.role IN (%@)", roleSQLArray(inRoleMask)];
 		}
 
 		query = [query stringByAppendingString:@" order by case "
@@ -222,18 +238,22 @@ LSGetApplicationForInfo(
 			@"end asc"];
 
 		FMResultSet* rs = [db executeQuery:query];
-		if ([rs next])
+		retval = kLSApplicationNotFoundErr;
+		// Registrations of bundles that were removed stay in the database; the first
+		// handler that is still on disk wins.
+		while ([rs next])
 		{
 			NSString* path = [rs stringForColumn:@"path"];
+			if (access([path fileSystemRepresentation], F_OK) != 0)
+				continue;
 			if (outAppURL)
 				*outAppURL = (CFURLRef) [[NSURL alloc] initFileURLWithPath:path isDirectory:YES];
 			if (outAppRef)
 				FSPathMakeRef((const UInt8*) [path fileSystemRepresentation], outAppRef, NULL);
 
 			retval = noErr;
+			break;
 		}
-		else
-			retval = kLSApplicationNotFoundErr;
 		[rs close];
 	}];
 
@@ -247,7 +267,7 @@ CFURLRef LSCopyDefaultApplicationURLForContentType(CFStringRef inContentType, LS
 
 	if (dq == nil)
 	{
-		if (*outError)
+		if (outError)
 			*outError = CFErrorCreate(NULL, kCFErrorDomainOSStatus, fnfErr, NULL);
 		return NULL;
 	}
@@ -269,13 +289,24 @@ CFURLRef LSCopyDefaultApplicationURLForContentType(CFStringRef inContentType, LS
 
 		FMResultSet* rs = [db executeQuery:query, inContentType];
 
-		if ([rs next])
+		NSString* path = nil;
+		while ([rs next])
 		{
-			retval = (CFURLRef) [[NSURL alloc] initFileURLWithPath: [rs stringForColumn:@"path"] isDirectory: YES];
+			NSString* candidate = [rs stringForColumn:@"path"];
+			if (bundleIsPresent(candidate))
+			{
+				path = candidate;
+				break;
+			}
+		}
+
+		if (path != nil)
+		{
+			retval = (CFURLRef) [[NSURL alloc] initFileURLWithPath: path isDirectory: YES];
 		}
 		else
 		{
-			if (*outError)
+			if (outError)
 				*outError = CFErrorCreate(NULL, kCFErrorDomainOSStatus, kLSApplicationNotFoundErr, NULL);
 			retval = NULL;
 		}
@@ -287,12 +318,12 @@ CFURLRef LSCopyDefaultApplicationURLForContentType(CFStringRef inContentType, LS
 
 CFURLRef LSCopyDefaultApplicationURLForURL(CFURLRef inURL, LSRolesMask inRoleMask, CFErrorRef  _Nullable *outError)
 {
-	CFURLRef retval;
+	CFURLRef retval = NULL;
 	OSStatus status = LSGetApplicationForURL(inURL, inRoleMask, NULL, &retval);
 
 	if (status != noErr)
 	{
-		if (*outError)
+		if (outError)
 			*outError = CFErrorCreate(NULL, kCFErrorDomainOSStatus, status, NULL);
 		return NULL;
 	}
@@ -306,15 +337,54 @@ CFURLRef LSCopyDefaultApplicationURLForURL(CFURLRef inURL, LSRolesMask inRoleMas
 
 OSStatus LSGetApplicationForURL(CFURLRef inURL, LSRolesMask inRoleMask, FSRef *outAppRef, CFURLRef *outAppURL)
 {
+	/* Web and mail links are opened by the host desktop, not by an application
+	   in the prefix, so there is none to report. An extension lookup would map
+	   https://x/a.html to a Mac application. */
+	if (_LSIsHostOpenURL(inURL))
+		return kLSApplicationNotFoundErr;
+
+	// A URL with a scheme other than file is opened by the application registered for the scheme.
+	CFStringRef scheme = inURL != NULL ? CFURLCopyScheme(inURL) : NULL;
+
+	if (scheme != NULL)
+	{
+		Boolean isFile = CFStringCompare(scheme, CFSTR("file"), kCFCompareCaseInsensitive) == kCFCompareEqualTo;
+		CFStringRef bundleID = isFile ? NULL : LSCopyDefaultHandlerForURLScheme(scheme);
+		CFArrayRef apps = bundleID != NULL ? LSCopyApplicationURLsForBundleIdentifier(bundleID, NULL) : NULL;
+		OSStatus status = kLSApplicationNotFoundErr;
+
+		CFRelease(scheme);
+		if (!isFile)
+		{
+			CFURLRef app = NULL;
+
+			/* Registrations of bundles that were removed stay in the database; skip them. */
+			for (CFIndex i = 0; apps != NULL && i < CFArrayGetCount(apps) && app == NULL; i++)
+			{
+				CFURLRef candidate = CFArrayGetValueAtIndex(apps, i);
+				char path[PATH_MAX];
+
+				if (CFURLGetFileSystemRepresentation(candidate, true, (UInt8 *) path, sizeof(path)) && access(path, F_OK) == 0)
+					app = candidate;
+			}
+			if (app != NULL)
+			{
+				if (outAppRef)
+					CFURLGetFSRef(app, (struct FSRef*) outAppRef);
+				if (outAppURL)
+					*outAppURL = (CFURLRef) CFRetain(app);
+				status = noErr;
+			}
+			if (apps != NULL)
+				CFRelease(apps);
+			if (bundleID != NULL)
+				CFRelease(bundleID);
+			return status;
+		}
+	}
+
 	NSString* extension = [(NSURL*) inURL pathExtension];
 	return LSGetApplicationForInfo(kLSUnknownType, kLSUnknownCreator, (CFStringRef) extension, inRoleMask, outAppRef, outAppURL);
-}
-
-CFArrayRef LSCopyAllHandlersForURLScheme(CFStringRef inURLScheme)
-{
-	puts("LSCopyAllHandlersForURLScheme STUB");
-	// NULL is a safe assumption to fall back on in the stub, since it means none were found.
-	return NULL;
 }
 
 CFArrayRef LSCopyAllRoleHandlersForContentType(CFStringRef inContentType, LSRolesMask inRole)
@@ -324,8 +394,559 @@ CFArrayRef LSCopyAllRoleHandlersForContentType(CFStringRef inContentType, LSRole
 	return NULL;
 }
 
+// The user's choice of default handlers is kept in the LaunchServices
+// preferences as an "LSHandlers" array. Each entry names either a URL
+// scheme or a content type and maps role keys to a bundle identifier.
+// Handlers declared by the installed applications come from the database.
+static const CFStringRef kLSHandlersPrefsDomain = CFSTR("com.apple.LaunchServices");
+static const CFStringRef kLSHandlersKey = CFSTR("LSHandlers");
+static const CFStringRef kLSHandlerURLSchemeKey = CFSTR("LSHandlerURLScheme");
+static const CFStringRef kLSHandlerContentTypeKey = CFSTR("LSHandlerContentType");
+static const CFStringRef kLSHandlerRoleAllKey = CFSTR("LSHandlerRoleAll");
+
+static const struct
+{
+	LSRolesMask role;
+	CFStringRef key;
+} kLSHandlerRoleKeys[] = {
+	{ kLSRolesNone, CFSTR("LSHandlerRoleNone") },
+	{ kLSRolesViewer, CFSTR("LSHandlerRoleViewer") },
+	{ kLSRolesEditor, CFSTR("LSHandlerRoleEditor") },
+	{ kLSRolesShell, CFSTR("LSHandlerRoleShell") },
+};
+
+static Boolean handlerMatches(CFDictionaryRef entry, CFStringRef matchKey, CFStringRef value)
+{
+	CFStringRef entryValue;
+
+	if (CFGetTypeID(entry) != CFDictionaryGetTypeID())
+		return FALSE;
+
+	entryValue = CFDictionaryGetValue(entry, matchKey);
+	return entryValue != NULL && CFGetTypeID(entryValue) == CFStringGetTypeID()
+		&& CFStringCompare(entryValue, value, kCFCompareCaseInsensitive) == kCFCompareEqualTo;
+}
+
+static CFArrayRef copyHandlers(void)
+{
+	CFPropertyListRef handlers = CFPreferencesCopyValue(kLSHandlersKey, kLSHandlersPrefsDomain,
+		kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
+
+	if (handlers != NULL && CFGetTypeID(handlers) != CFArrayGetTypeID())
+	{
+		CFRelease(handlers);
+		handlers = NULL;
+	}
+	return (CFArrayRef) handlers;
+}
+
+// Returns the bundle ID the user chose for the first role key in roleKeys
+// that has one.
+static CFStringRef copyUserHandler(CFStringRef matchKey, CFStringRef value, const CFStringRef* roleKeys, CFIndex roleKeyCount)
+{
+	CFArrayRef handlers = copyHandlers();
+	CFStringRef result = NULL;
+
+	if (handlers == NULL)
+		return NULL;
+
+	for (CFIndex i = 0; i < CFArrayGetCount(handlers) && result == NULL; i++)
+	{
+		CFDictionaryRef entry = CFArrayGetValueAtIndex(handlers, i);
+
+		if (!handlerMatches(entry, matchKey, value))
+			continue;
+
+		for (CFIndex j = 0; j < roleKeyCount; j++)
+		{
+			CFStringRef bundleID = CFDictionaryGetValue(entry, roleKeys[j]);
+			if (bundleID != NULL && CFGetTypeID(bundleID) == CFStringGetTypeID())
+			{
+				result = CFStringCreateCopy(NULL, bundleID);
+				break;
+			}
+		}
+	}
+
+	CFRelease(handlers);
+	return result;
+}
+
+static OSStatus setUserHandler(CFStringRef matchKey, CFStringRef value, const CFStringRef* roleKeys, CFIndex roleKeyCount, CFStringRef bundleID)
+{
+	CFArrayRef handlers = copyHandlers();
+	CFMutableArrayRef newHandlers;
+	CFMutableDictionaryRef entry = NULL;
+	CFIndex i, count;
+	Boolean synced;
+
+	newHandlers = handlers != NULL
+		? CFArrayCreateMutableCopy(NULL, 0, handlers)
+		: CFArrayCreateMutable(NULL, 0, &kCFTypeArrayCallBacks);
+	if (handlers != NULL)
+		CFRelease(handlers);
+
+	count = CFArrayGetCount(newHandlers);
+	for (i = 0; i < count; i++)
+	{
+		CFDictionaryRef existing = CFArrayGetValueAtIndex(newHandlers, i);
+		if (handlerMatches(existing, matchKey, value))
+		{
+			entry = CFDictionaryCreateMutableCopy(NULL, 0, existing);
+			break;
+		}
+	}
+
+	if (entry == NULL)
+	{
+		entry = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+		CFDictionarySetValue(entry, matchKey, value);
+	}
+
+	for (CFIndex j = 0; j < roleKeyCount; j++)
+		CFDictionarySetValue(entry, roleKeys[j], bundleID);
+
+	if (i < count)
+		CFArraySetValueAtIndex(newHandlers, i, entry);
+	else
+		CFArrayAppendValue(newHandlers, entry);
+	CFRelease(entry);
+
+	CFPreferencesSetValue(kLSHandlersKey, newHandlers, kLSHandlersPrefsDomain,
+		kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
+	CFRelease(newHandlers);
+
+	synced = CFPreferencesSynchronize(kLSHandlersPrefsDomain, kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
+	return synced ? noErr : kLSUnknownErr;
+}
+
+// Role keys to look at for inRole, most specific first.
+static CFIndex roleKeysForMask(LSRolesMask inRole, CFStringRef* keys)
+{
+	CFIndex count = 0;
+
+	if (inRole != kLSRolesAll)
+	{
+		for (size_t i = 0; i < sizeof(kLSHandlerRoleKeys) / sizeof(kLSHandlerRoleKeys[0]); i++)
+		{
+			if (inRole & kLSHandlerRoleKeys[i].role)
+				keys[count++] = kLSHandlerRoleKeys[i].key;
+		}
+	}
+	return count;
+}
+
+static CFStringRef copyDeclaredHandler(NSString* query, CFStringRef value)
+{
+	__block CFStringRef retval = NULL;
+	FMDatabaseQueue* dq = getDatabaseQueue();
+
+	if (dq == nil)
+		return NULL;
+
+	[dq inDatabase:^(FMDatabase* db) {
+		FMResultSet* rs = [db executeQuery:query, value];
+		while ([rs next])
+		{
+			if (bundleIsPresent([rs stringForColumn:@"path"]))
+			{
+				retval = (CFStringRef) [[rs stringForColumn:@"bundle_id"] copy];
+				break;
+			}
+		}
+		[rs close];
+	}];
+
+	return retval;
+}
+
 CFStringRef LSCopyDefaultHandlerForURLScheme(CFStringRef inURLScheme)
 {
-	puts("LSCopyDefaultHandlerForURLScheme STUB");
-	return NULL; // (could also return "" I guess)
+	CFStringRef roleKeys[] = { kLSHandlerRoleAllKey };
+	CFStringRef handler;
+
+	if (inURLScheme == NULL)
+		return NULL;
+
+	handler = copyUserHandler(kLSHandlerURLSchemeKey, inURLScheme, roleKeys, 1);
+	if (handler != NULL)
+		return handler;
+
+	return copyDeclaredHandler(@"select bundle.bundle_id, bundle.path from bundle"
+		@" INNER JOIN bundle_url_type T on T.bundle=bundle.id"
+		@" INNER JOIN bundle_url_type_scheme S on S.type=T.id"
+		@" where bundle.package_type='APPL' and S.scheme=?", inURLScheme);
+}
+
+// Bundle identifiers of the applications that declare the scheme in CFBundleURLTypes.
+static NSArray<NSString*>* copyDeclaredHandlersForScheme(CFStringRef inURLScheme)
+{
+	NSMutableArray<NSString*>* result = [NSMutableArray array];
+	FMDatabaseQueue* dq = getDatabaseQueue();
+
+	if (dq == nil)
+		return result;
+
+	[dq inDatabase:^(FMDatabase* db) {
+		FMResultSet* rs = [db executeQuery:@"select distinct bundle.bundle_id, bundle.path from bundle"
+			@" INNER JOIN bundle_url_type T on T.bundle=bundle.id"
+			@" INNER JOIN bundle_url_type_scheme S on S.type=T.id"
+			@" where bundle.package_type='APPL' and S.scheme=?", (NSString*) inURLScheme];
+		while ([rs next])
+		{
+			NSString* bundleID = [rs stringForColumn:@"bundle_id"];
+			if (bundleIsPresent([rs stringForColumn:@"path"]) && ![result containsObject:bundleID])
+				[result addObject:bundleID];
+		}
+		[rs close];
+	}];
+	return result;
+}
+
+// The handlers of a scheme, the user's choice (if any) first, as bundle identifiers.
+static NSArray<NSString*>* copyHandlersForScheme(CFStringRef inURLScheme)
+{
+	NSMutableArray<NSString*>* result = [NSMutableArray array];
+	CFStringRef roleKeys[] = { kLSHandlerRoleAllKey };
+	CFStringRef preferred = copyUserHandler(kLSHandlerURLSchemeKey, inURLScheme, roleKeys, 1);
+
+	if (preferred != NULL)
+	{
+		[result addObject:(NSString*) preferred];
+		CFRelease(preferred);
+	}
+	for (NSString* bundleID in copyDeclaredHandlersForScheme(inURLScheme))
+	{
+		BOOL known = NO;
+		for (NSString* existing in result)
+			known |= [existing caseInsensitiveCompare:bundleID] == NSOrderedSame;
+		if (!known)
+			[result addObject:bundleID];
+	}
+	return result;
+}
+
+CFArrayRef LSCopyAllHandlersForURLScheme(CFStringRef inURLScheme)
+{
+	if (inURLScheme == NULL)
+		return NULL;
+
+	NSArray<NSString*>* handlers = copyHandlersForScheme(inURLScheme);
+
+	return [handlers count] > 0 ? (CFArrayRef) [handlers retain] : NULL;
+}
+
+OSStatus LSSetDefaultHandlerForURLScheme(CFStringRef inURLScheme, CFStringRef inHandlerBundleID)
+{
+	CFStringRef roleKeys[] = { kLSHandlerRoleAllKey };
+
+	if (inURLScheme == NULL || inHandlerBundleID == NULL)
+		return paramErr;
+
+	return setUserHandler(kLSHandlerURLSchemeKey, inURLScheme, roleKeys, 1, inHandlerBundleID);
+}
+
+CFStringRef LSCopyDefaultRoleHandlerForContentType(CFStringRef inContentType, LSRolesMask inRole)
+{
+	CFStringRef roleKeys[5];
+	CFIndex count;
+	CFStringRef handler;
+	NSString* query;
+
+	if (inContentType == NULL)
+		return NULL;
+
+	count = roleKeysForMask(inRole, roleKeys);
+	roleKeys[count++] = kLSHandlerRoleAllKey;
+
+	handler = copyUserHandler(kLSHandlerContentTypeKey, inContentType, roleKeys, count);
+	if (handler != NULL)
+		return handler;
+
+	query = @"select bundle.bundle_id, bundle.path, AD.rank from bundle INNER JOIN app_doc AD on AD.bundle=bundle.id"
+		@" INNER JOIN app_doc_uti AU on AU.doc=AD.id WHERE bundle.package_type='APPL' AND AU.uti=?";
+	if (inRole != kLSRolesAll)
+		query = [query stringByAppendingFormat:@" and AD.role in (%@)", roleSQLArray(inRole)];
+	query = [query stringByAppendingString:@" order by case "
+		@"when AD.rank='Owner' then 1 "
+		@"when AD.rank='Default' then 2 "
+		@"when AD.rank='Alternate' then 3 "
+		@"else 5 "
+		@"end asc"];
+
+	return copyDeclaredHandler(query, inContentType);
+}
+
+OSStatus LSSetDefaultRoleHandlerForContentType(CFStringRef inContentType, LSRolesMask inRole, CFStringRef inHandlerBundleID)
+{
+	CFStringRef roleKeys[4];
+	CFIndex count;
+
+	if (inContentType == NULL || inHandlerBundleID == NULL)
+		return paramErr;
+
+	if (inRole == kLSRolesAll)
+	{
+		roleKeys[0] = kLSHandlerRoleAllKey;
+		count = 1;
+	}
+	else
+		count = roleKeysForMask(inRole, roleKeys);
+
+	if (count == 0)
+		return paramErr;
+
+	return setUserHandler(kLSHandlerContentTypeKey, inContentType, roleKeys, count, inHandlerBundleID);
+}
+
+OSStatus LSCopyApplicationForMIMEType(CFStringRef inMIMEType, LSRolesMask inRoleMask, CFURLRef *outAppURL)
+{
+	if (!outAppURL)
+		return paramErr;
+	*outAppURL = NULL;
+
+	if (!inMIMEType)
+		return paramErr;
+
+	CFStringRef uti = UTTypeCreatePreferredIdentifierForTag(kUTTagClassMIMEType, inMIMEType, NULL);
+	if (!uti)
+		return kLSApplicationNotFoundErr;
+
+	CFURLRef appURL = LSCopyDefaultApplicationURLForContentType(uti, inRoleMask, NULL);
+	CFRelease(uti);
+
+	if (appURL)
+	{
+		*outAppURL = appURL;
+		return noErr;
+	}
+	return kLSApplicationNotFoundErr;
+}
+
+// Attribute names of the item queries. The values are what macOS reports for these symbols.
+const CFStringRef kLSItemIsInvisible = CFSTR("LSItemIsInvisible");
+const CFStringRef kLSItemExtensionIsHidden = CFSTR("LSItemExtensionIsHidden");
+const CFStringRef kLSItemQuarantineProperties = CFSTR("LSItemQuarantineProperties");
+
+// Answers a boolean attribute from the URL resource property it is documented to map to.
+static OSStatus copyItemBooleanAttribute(const FSRef *inItem, CFStringRef resourceKey, CFTypeRef *outValue)
+{
+	CFURLRef url = CFURLCreateFromFSRef(kCFAllocatorDefault, (struct FSRef *) inItem);
+	if (!url)
+		return fnfErr;
+
+	CFTypeRef value = NULL;
+	CFErrorRef error = NULL;
+	if (!CFURLCopyResourcePropertyForKey(url, resourceKey, &value, &error) || !value || CFGetTypeID(value) != CFBooleanGetTypeID())
+	{
+		if (value)
+			CFRelease(value);
+		if (error)
+			CFRelease(error);
+		CFRelease(url);
+		return kLSDataUnavailableErr;
+	}
+	CFRelease(url);
+	*outValue = value;
+	return noErr;
+}
+
+OSStatus LSCopyItemAttribute(const FSRef *inItem, LSRolesMask inRoles, CFStringRef inAttributeName, CFTypeRef *outValue)
+{
+	if (!inItem || !inAttributeName || !outValue)
+		return paramErr;
+	*outValue = NULL;
+
+	if (CFEqual(inAttributeName, kLSItemIsInvisible))
+		return copyItemBooleanAttribute(inItem, kCFURLIsHiddenKey, outValue);
+	if (CFEqual(inAttributeName, kLSItemExtensionIsHidden))
+		return copyItemBooleanAttribute(inItem, kCFURLHasHiddenExtensionKey, outValue);
+	if (CFEqual(inAttributeName, kLSItemQuarantineProperties))
+	{
+		// Quarantine properties are not stored, so no item carries them. macOS reports
+		// kLSDataUnavailableErr for an item without them (black-box observation).
+		return kLSDataUnavailableErr;
+	}
+	// An attribute name that is not one of the item attributes is a parameter error (black-box observation).
+	return paramErr;
+}
+
+// Like macOS, the call fails without a result when any requested attribute cannot be answered.
+OSStatus LSCopyItemAttributes(const FSRef *inItem, LSRolesMask inRoles, CFArrayRef inAttributeNames, CFDictionaryRef *outValues)
+{
+	if (!inItem || !inAttributeNames || !outValues)
+		return paramErr;
+	*outValues = NULL;
+
+	CFIndex count = CFArrayGetCount(inAttributeNames);
+	CFMutableDictionaryRef dict = CFDictionaryCreateMutable(kCFAllocatorDefault, count, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+	for (CFIndex i = 0; i < count; i++)
+	{
+		CFStringRef name = (CFStringRef) CFArrayGetValueAtIndex(inAttributeNames, i);
+		CFTypeRef value = NULL;
+		OSStatus status = LSCopyItemAttribute(inItem, inRoles, name, &value);
+		if (status != noErr)
+		{
+			CFRelease(dict);
+			return status;
+		}
+		CFDictionarySetValue(dict, name, value);
+		CFRelease(value);
+	}
+	*outValues = dict;
+	return noErr;
+}
+
+OSStatus LSCopyDisplayNameForURL(CFURLRef inURL, CFStringRef *outDisplayName)
+{
+	if (!inURL || !outDisplayName)
+		return paramErr;
+
+	NSString* path = [(NSURL*)inURL path];
+	if (!path)
+		return paramErr;
+
+	NSString* lastComp = [path lastPathComponent];
+	if (!lastComp)
+		lastComp = path;
+
+	*outDisplayName = (CFStringRef)[lastComp copy];
+	return noErr;
+}
+
+CFArrayRef LSCopyApplicationURLsForURL(CFURLRef inURL, LSRolesMask inRoleMask)
+{
+	CFStringRef scheme;
+	NSMutableArray* urls;
+
+	if (inURL == NULL)
+		return NULL;
+
+	// Only URLs for a URL scheme are answered; the applications for a document come from its content type.
+	scheme = CFURLCopyScheme(inURL);
+	if (scheme == NULL)
+		return NULL;
+	if (CFStringCompare(scheme, CFSTR("file"), kCFCompareCaseInsensitive) == kCFCompareEqualTo)
+	{
+		CFRelease(scheme);
+		return NULL;
+	}
+
+	urls = [NSMutableArray array];
+	for (NSString* bundleID in copyHandlersForScheme(scheme))
+	{
+		CFArrayRef apps = LSCopyApplicationURLsForBundleIdentifier((CFStringRef) bundleID, NULL);
+
+		if (apps == NULL)
+			continue;
+		for (id app in (NSArray*) apps)
+			if (![urls containsObject:app])
+				[urls addObject:app];
+		CFRelease(apps);
+	}
+	CFRelease(scheme);
+
+	return [urls count] > 0 ? (CFArrayRef) [urls retain] : NULL;
+}
+
+OSStatus LSCanURLAcceptURL(CFURLRef inItemURL, CFURLRef inTargetURL, LSRolesMask inRoleMask, LSAcceptanceFlags inFlags, Boolean *outAcceptsItem)
+{
+	if (!inItemURL || !inTargetURL || !outAcceptsItem)
+		return paramErr;
+	*outAcceptsItem = false;
+	return noErr;
+}
+
+OSStatus LSCopyItemInfoForURL(CFURLRef inURL, LSRequestedInfo inWhichInfo, LSItemInfoRecord *outItemInfo)
+{
+	UInt8 path[PATH_MAX];
+	struct stat st;
+
+	if (!inURL || !outItemInfo)
+		return paramErr;
+	memset(outItemInfo, 0, sizeof(*outItemInfo));
+
+	if (!CFURLGetFileSystemRepresentation(inURL, true, path, sizeof(path)) || lstat((const char *) path, &st) != 0)
+		return fnfErr;
+
+	CFStringRef extension = CFURLCopyPathExtension(inURL);
+
+	if (inWhichInfo & (kLSRequestBasicFlagsOnly | kLSRequestAppTypeFlags | kLSRequestAllFlags))
+	{
+		if (S_ISLNK(st.st_mode))
+		{
+			outItemInfo->flags |= kLSItemInfoIsSymlink;
+			stat((const char *) path, &st);
+		}
+		if (S_ISDIR(st.st_mode))
+		{
+			outItemInfo->flags |= kLSItemInfoIsContainer;
+			if (extension && (CFEqual(extension, CFSTR("app")) || CFEqual(extension, CFSTR("bundle")) || CFEqual(extension, CFSTR("framework"))))
+				outItemInfo->flags |= kLSItemInfoIsPackage;
+			if (extension && CFEqual(extension, CFSTR("app")))
+				outItemInfo->flags |= kLSItemInfoIsApplication | kLSItemInfoIsNativeApp;
+		}
+		else
+		{
+			outItemInfo->flags |= kLSItemInfoIsPlainFile;
+		}
+		const char *slash = strrchr((const char *) path, '/');
+		if ((slash ? slash[1] : path[0]) == '.')
+			outItemInfo->flags |= kLSItemInfoIsInvisible;
+	}
+
+	if (inWhichInfo & (kLSRequestBasicFlagsOnly | kLSRequestAppTypeFlags | kLSRequestAllFlags | kLSRequestExtensionFlagsOnly))
+	{
+		// Follows the Finder's extension-hidden flag of the item, as NSURLHasHiddenExtensionKey does.
+		CFTypeRef hidden = NULL;
+		CFErrorRef error = NULL;
+		if (CFURLCopyResourcePropertyForKey(inURL, kCFURLHasHiddenExtensionKey, &hidden, &error) && hidden && CFGetTypeID(hidden) == CFBooleanGetTypeID() && CFBooleanGetValue(hidden))
+			outItemInfo->flags |= kLSItemInfoExtensionIsHidden;
+		if (hidden)
+			CFRelease(hidden);
+		if (error)
+			CFRelease(error);
+	}
+
+	if ((inWhichInfo & kLSRequestExtension) && extension)
+		outItemInfo->extension = CFRetain(extension);
+	if (extension)
+		CFRelease(extension);
+	return noErr;
+}
+
+OSStatus LSSetExtensionHiddenForURL(CFURLRef inURL, Boolean hide)
+{
+	if (!inURL)
+		return paramErr;
+
+	CFErrorRef error = NULL;
+	if (CFURLSetResourcePropertyForKey(inURL, kCFURLHasHiddenExtensionKey, hide ? kCFBooleanTrue : kCFBooleanFalse, &error))
+		return noErr;
+
+	// A missing item is a file-not-found error; any other failure is reported as unknown.
+	OSStatus status = kLSUnknownErr;
+	if (error && CFErrorGetCode(error) == ENOENT)
+		status = fnfErr;
+	if (error)
+		CFRelease(error);
+	return status;
+}
+
+OSStatus LSSetExtensionHiddenForRef(const FSRef *inRef, Boolean hide)
+{
+	if (!inRef)
+		return paramErr;
+
+	CFURLRef url = CFURLCreateFromFSRef(kCFAllocatorDefault, (struct FSRef *) inRef);
+	if (!url)
+		return fnfErr;
+	OSStatus status = LSSetExtensionHiddenForURL(url, hide);
+	CFRelease(url);
+	return status;
+}
+
+OSStatus _LSSetWeakBindingURLForType(int sessionID, int unknown, CFStringRef contentType, LSRolesMask roles, CFURLRef appURL)
+{
+	return kLSUnknownErr;
 }

@@ -79,16 +79,54 @@ enum
 extern const CFStringRef kCVPixelBufferIOSurfacePropertiesKey;
 extern const CFStringRef kCVPixelBufferOpenGLCompatibilityKey;
 extern const CFStringRef kCVPixelBufferPixelFormatTypeKey;
+extern const CFStringRef kCVPixelBufferCGImageCompatibilityKey;
+extern const CFStringRef kCVPixelBufferCGBitmapContextCompatibilityKey;
 extern const CFStringRef kCVPixelBufferMetalCompatibilityKey;
 extern const CFStringRef kCVPixelBufferBytesPerRowAlignmentKey;
 extern const CFStringRef kCVPixelBufferHeightKey;
 extern const CFStringRef kCVPixelBufferWidthKey;
 
 typedef CVImageBufferRef CVPixelBufferRef;
-typedef void (*CVPixelBufferReleaseBytesCallback)(void *releaseRefCon, const void *baseAddress);
+typedef CVOptionFlags CVPixelBufferLockFlags;
 
-// TODO: This header file is incomplete
-CVReturn CVPixelBufferCreateWithBytes(CFAllocatorRef allocator, size_t width, size_t height, OSType pixelFormatType, void *baseAddress, size_t bytesPerRow, CVPixelBufferReleaseBytesCallback releaseCallback, void *releaseRefCon, CFDictionaryRef pixelBufferAttributes, CVPixelBufferRef  _Nullable *pixelBufferOut);
+enum {
+	kCVPixelBufferLock_ReadOnly = 0x00000001,
+};
+typedef void (*CVPixelBufferReleaseBytesCallback)(void *releaseRefCon, const void *baseAddress);
+typedef void (*CVPixelBufferReleasePlanarBytesCallback)(void *releaseRefCon, const void *dataPtr, size_t dataSize,
+	size_t numberOfPlanes, const void *planeAddresses[]);
+
+CV_EXPORT CFTypeID CVPixelBufferGetTypeID(void);
+CV_EXPORT CVPixelBufferRef CVPixelBufferRetain(CVPixelBufferRef pixelBuffer);
+CV_EXPORT void CVPixelBufferRelease(CVPixelBufferRef pixelBuffer);
+
+CV_EXPORT CVReturn CVPixelBufferCreate(CFAllocatorRef allocator, size_t width, size_t height, OSType pixelFormatType,
+	CFDictionaryRef pixelBufferAttributes, CVPixelBufferRef *pixelBufferOut);
+
+CV_EXPORT CVReturn CVPixelBufferCreateWithBytes(CFAllocatorRef allocator, size_t width, size_t height, OSType pixelFormatType,
+	void *baseAddress, size_t bytesPerRow, CVPixelBufferReleaseBytesCallback releaseCallback, void *releaseRefCon,
+	CFDictionaryRef pixelBufferAttributes, CVPixelBufferRef  _Nullable *pixelBufferOut);
+
+CV_EXPORT CVReturn CVPixelBufferCreateWithPlanarBytes(CFAllocatorRef allocator, size_t width, size_t height,
+	OSType pixelFormatType, void *dataPtr, size_t dataSize, size_t numberOfPlanes, void *planeBaseAddress[],
+	size_t planeWidth[], size_t planeHeight[], size_t planeBytesPerRow[],
+	CVPixelBufferReleasePlanarBytesCallback releaseCallback, void *releaseRefCon,
+	CFDictionaryRef pixelBufferAttributes, CVPixelBufferRef *pixelBufferOut);
+
+CV_EXPORT size_t CVPixelBufferGetWidth(CVPixelBufferRef pixelBuffer);
+CV_EXPORT size_t CVPixelBufferGetHeight(CVPixelBufferRef pixelBuffer);
+CV_EXPORT size_t CVPixelBufferGetBytesPerRow(CVPixelBufferRef pixelBuffer);
+CV_EXPORT OSType CVPixelBufferGetPixelFormatType(CVPixelBufferRef pixelBuffer);
+CV_EXPORT size_t CVPixelBufferGetDataSize(CVPixelBufferRef pixelBuffer);
+CV_EXPORT void* CV_NULLABLE CVPixelBufferGetBaseAddress(CVPixelBufferRef pixelBuffer);
+CV_EXPORT size_t CVPixelBufferGetPlaneCount(CVPixelBufferRef pixelBuffer);
+CV_EXPORT Boolean CVPixelBufferIsPlanar(CVPixelBufferRef pixelBuffer);
+CV_EXPORT void* CV_NULLABLE CVPixelBufferGetBaseAddressOfPlane(CVPixelBufferRef pixelBuffer, size_t planeIndex);
+CV_EXPORT size_t CVPixelBufferGetBytesPerRowOfPlane(CVPixelBufferRef pixelBuffer, size_t planeIndex);
+CV_EXPORT size_t CVPixelBufferGetWidthOfPlane(CVPixelBufferRef pixelBuffer, size_t planeIndex);
+CV_EXPORT size_t CVPixelBufferGetHeightOfPlane(CVPixelBufferRef pixelBuffer, size_t planeIndex);
+CV_EXPORT CVReturn CVPixelBufferLockBaseAddress(CVPixelBufferRef pixelBuffer, CVPixelBufferLockFlags lockFlags);
+CV_EXPORT CVReturn CVPixelBufferUnlockBaseAddress(CVPixelBufferRef pixelBuffer, CVPixelBufferLockFlags unlockFlags);
 
 __END_DECLS
 

@@ -1,7 +1,7 @@
 /*
  This file is part of Darling.
 
- Copyright (C) 2019 Lubos Dolezel
+ Copyright (C) 2026 Lubos Dolezel
 
  Darling is free software: you can redistribute it and/or modify
  it under the terms of the GNU General Public License as published by
@@ -17,18 +17,37 @@
  along with Darling.  If not, see <http://www.gnu.org/licenses/>.
 */
 
-#import <CloudKit/CKQueryOperation.h>
+#import "CKInternal.h"
 
 @implementation CKQueryOperation
 
-- (NSMethodSignature *)methodSignatureForSelector:(SEL)aSelector
+@synthesize query = _query;
+@synthesize cursor = _cursor;
+@synthesize zoneID = _zoneID;
+@synthesize resultsLimit = _resultsLimit;
+@synthesize desiredKeys = _desiredKeys;
+@synthesize recordFetchedBlock = _recordFetchedBlock;
+@synthesize queryCompletionBlock = _queryCompletionBlock;
+
+const NSUInteger CKQueryOperationMaximumResults = 0;
+
+- (instancetype)initWithQuery:(CKQuery *)query
 {
-    return [NSMethodSignature signatureWithObjCTypes: "v@:"];
+    if ((self = [super init]))
+        _query = [query copy];
+    return self;
 }
 
-- (void)forwardInvocation:(NSInvocation *)anInvocation
+- (instancetype)initWithCursor:(CKQueryCursor *)cursor
 {
-    NSLog(@"Stub called: %@ in %@", NSStringFromSelector([anInvocation selector]), [self class]);
+    if ((self = [super init]))
+        _cursor = [cursor copy];
+    return self;
 }
 
+- (void)_performWithError:(NSError *)error
+{
+    if (_queryCompletionBlock)
+        _queryCompletionBlock(nil, error);
+}
 @end

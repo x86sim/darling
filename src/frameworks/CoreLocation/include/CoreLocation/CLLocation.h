@@ -19,6 +19,41 @@
 
 #include <Foundation/Foundation.h>
 
+typedef double CLLocationAccuracy;
+typedef double CLLocationDegrees;
+
+typedef struct CLLocationCoordinate2D
+{
+    CLLocationDegrees latitude;
+    CLLocationDegrees longitude;
+} CLLocationCoordinate2D;
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+static inline CLLocationCoordinate2D CLLocationCoordinate2DMake(CLLocationDegrees latitude, CLLocationDegrees longitude)
+{
+    CLLocationCoordinate2D coordinate;
+    coordinate.latitude = latitude;
+    coordinate.longitude = longitude;
+    return coordinate;
+}
+
+// YES when the latitude is within -90...90 and the longitude within -180...180 (both ends included).
+extern BOOL CLLocationCoordinate2DIsValid(CLLocationCoordinate2D coord);
+
+#ifdef __cplusplus
+}
+#endif
+
+extern const CLLocationAccuracy kCLLocationAccuracyBestForNavigation;
+extern const CLLocationAccuracy kCLLocationAccuracyBest;
+extern const CLLocationAccuracy kCLLocationAccuracyNearestTenMeters;
+extern const CLLocationAccuracy kCLLocationAccuracyHundredMeters;
+extern const CLLocationAccuracy kCLLocationAccuracyKilometer;
+extern const CLLocationAccuracy kCLLocationAccuracyThreeKilometers;
+
 @interface CLLocation : NSObject
 
 @end

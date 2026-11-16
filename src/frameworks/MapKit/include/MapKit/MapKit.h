@@ -22,6 +22,7 @@
 #define _MapKit_H_
 
 #import <Foundation/Foundation.h>
+#import <MapKit/MKGeometry.h>
 
 #import <MapKit/CAAnimationDelegate.h>
 #import <MapKit/CALayerDelegate.h>

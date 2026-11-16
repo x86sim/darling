@@ -1,7 +1,7 @@
 /*
  This file is part of Darling.
 
- Copyright (C) 2019 Lubos Dolezel
+ Copyright (C) 2026 Lubos Dolezel
 
  Darling is free software: you can redistribute it and/or modify
  it under the terms of the GNU General Public License as published by
@@ -17,18 +17,31 @@
  along with Darling.  If not, see <http://www.gnu.org/licenses/>.
 */
 
-#import <CloudKit/CKFetchRecordsOperation.h>
+#import "CKInternal.h"
 
 @implementation CKFetchRecordsOperation
 
-- (NSMethodSignature *)methodSignatureForSelector:(SEL)aSelector
+@synthesize recordIDs = _recordIDs;
+@synthesize desiredKeys = _desiredKeys;
+@synthesize perRecordProgressBlock = _perRecordProgressBlock;
+@synthesize perRecordCompletionBlock = _perRecordCompletionBlock;
+@synthesize fetchRecordsCompletionBlock = _fetchRecordsCompletionBlock;
+
+- (instancetype)initWithRecordIDs:(NSArray<CKRecordID *> *)recordIDs
 {
-    return [NSMethodSignature signatureWithObjCTypes: "v@:"];
+    if ((self = [super init]))
+        _recordIDs = [recordIDs copy];
+    return self;
 }
 
-- (void)forwardInvocation:(NSInvocation *)anInvocation
++ (instancetype)fetchCurrentUserRecordOperation
 {
-    NSLog(@"Stub called: %@ in %@", NSStringFromSelector([anInvocation selector]), [self class]);
+    return [[self alloc] init];
 }
 
+- (void)_performWithError:(NSError *)error
+{
+    if (_fetchRecordsCompletionBlock)
+        _fetchRecordsCompletionBlock(nil, error);
+}
 @end

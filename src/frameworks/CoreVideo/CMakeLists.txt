@@ -21,13 +21,17 @@ add_framework(CoreVideo
 
     SOURCES
 	    src/constants.c
-	    src/stubs.c
+	    src/CVPixelBuffer.c
+	    src/CVMetalTexture.c
+	    src/CVOpenGLTextureCache.c
         src/CVDisplayLink.mm
 
     DEPENDENCIES
         system
         Foundation
         CoreGraphics
+        IOSurface
+        OpenGL
         cxx
 )
 

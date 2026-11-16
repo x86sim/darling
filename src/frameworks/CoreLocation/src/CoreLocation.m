@@ -293,16 +293,11 @@ void* CLLocationCoordinate2DGetDistanceFrom(void)
     return NULL;
 }
 
-void* CLLocationCoordinate2DIsValid(void)
+BOOL CLLocationCoordinate2DIsValid(CLLocationCoordinate2D coord)
 {
-    if (verbose) puts("STUB: CLLocationCoordinate2DIsValid called");
-    return NULL;
-}
-
-void* CLLocationCoordinate2DMake(void)
-{
-    if (verbose) puts("STUB: CLLocationCoordinate2DMake called");
-    return NULL;
+    // Comparisons with NaN are false, so a NaN component is invalid, as is an infinite one.
+    return coord.latitude >= -90.0 && coord.latitude <= 90.0 &&
+           coord.longitude >= -180.0 && coord.longitude <= 180.0;
 }
 
 void* CLPingDaemon(void)

@@ -72,6 +72,14 @@ struct elf_calls
 	int (*dserver_process_lifetime_pipe_refresh)(void);
 	void (*dserver_close_process_lifetime_pipe)(int fd);
 
+	// fork() through the host libc; returns the child's PID, 0 in the child,
+	// or a negative Linux errno
+	int (*native_fork)(void);
+
+	// The Darwin RLIMIT_NOFILE soft and hard limits passed on by the Darling
+	// process that exec'd this one. Returns 0 and fills limits, or -1 if
+	// there are none (the Linux limit applies).
+	int (*inherited_nofile_limit)(unsigned int limits[2]);
 	// x86Sim (2026-11-13): first thing in a fork's child (sys_fork, before guard_table_postfork_child closes the
 	// parent's descriptors through mldr's socket bitmap): mldr's locks as fresh ones. The fork is the raw syscall
 	// (glibc's fork() needs glibc's thread pointer, which Darling threads do not keep: Darling hung at boot with it),
@@ -81,4 +89,3 @@ struct elf_calls
 };
 
 #endif
-

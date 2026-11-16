@@ -21,14 +21,19 @@
 #import <Foundation/NSArray.h>
 #import <Foundation/NSString.h>
 #import <Foundation/NSDictionary.h>
+#import <Foundation/NSSet.h>
 #include <CoreFoundation/CFBag.h>
 #include <FSEvents/FSEvents.h>
 #include <dispatch/dispatch.h>
 
+// Returns the next event ID of the counter shared by all streams.
+extern uint64_t _FSEventsAllocateEventID(void) __attribute__((visibility("hidden")));
+
 @interface FSEventsImpl : NSObject
 {
 	NSArray<NSString*>* _pathsToWatch;
-	NSDictionary<NSNumber*, NSString*>* _wdMap;
+	NSMutableDictionary<NSNumber*, NSString*>* _wdMap;
+	NSSet<NSNumber*>* _rootWds;
 
 	FSEventStreamCreateFlags _flags;
 	FSEventStreamContext _context;
@@ -40,6 +45,11 @@
 	int _fd;
 	FSEventStreamEventId _lastEventID;
 	bool _running;
+	CFTimeInterval _latency;
+	bool _deliveryArmed;
+	CFAbsoluteTime _lastDelivery;
+	bool _invalidated;
+	int _runLoopSignalled;
 
 	NSMutableArray* _pathArray;
 	FSEventStreamEventFlags* _flagArray;
@@ -47,6 +57,7 @@
 }
 
 -(instancetype)initWithPaths:(NSArray*)pathsToWatch
+					latency:(CFTimeInterval)latency
 						flags:(FSEventStreamCreateFlags)flags
 					context:(FSEventStreamContext*)context
 					callback:(FSEventStreamCallback)callback;
@@ -61,7 +72,10 @@
 -(void)start;
 -(void)stop;
 -(FSEventStreamEventId)lastEventID;
--(void)_doCallback;
+-(FSEventStreamEventId)flushPendingEvents;
+-(NSString*)copyStreamDescription;
+-(void)_readEvents;
+-(void)_performFromRunLoop;
 
 @end
 

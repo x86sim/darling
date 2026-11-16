@@ -1,7 +1,7 @@
 /*
  This file is part of Darling.
 
- Copyright (C) 2019 Lubos Dolezel
+ Copyright (C) 2026 Lubos Dolezel
 
  Darling is free software: you can redistribute it and/or modify
  it under the terms of the GNU General Public License as published by
@@ -17,18 +17,38 @@
  along with Darling.  If not, see <http://www.gnu.org/licenses/>.
 */
 
-#import <CloudKit/CKModifyRecordsOperation.h>
+#import "CKInternal.h"
 
 @implementation CKModifyRecordsOperation
 
-- (NSMethodSignature *)methodSignatureForSelector:(SEL)aSelector
+@synthesize recordsToSave = _recordsToSave;
+@synthesize recordIDsToDelete = _recordIDsToDelete;
+@synthesize savePolicy = _savePolicy;
+@synthesize clientChangeTokenData = _clientChangeTokenData;
+@synthesize atomic = _atomic;
+@synthesize perRecordProgressBlock = _perRecordProgressBlock;
+@synthesize perRecordCompletionBlock = _perRecordCompletionBlock;
+@synthesize modifyRecordsCompletionBlock = _modifyRecordsCompletionBlock;
+
+- (instancetype)init
 {
-    return [NSMethodSignature signatureWithObjCTypes: "v@:"];
+    if ((self = [super init]))
+        _atomic = YES;
+    return self;
 }
 
-- (void)forwardInvocation:(NSInvocation *)anInvocation
+- (instancetype)initWithRecordsToSave:(NSArray<CKRecord *> *)records recordIDsToDelete:(NSArray<CKRecordID *> *)recordIDs
 {
-    NSLog(@"Stub called: %@ in %@", NSStringFromSelector([anInvocation selector]), [self class]);
+    if ((self = [self init])) {
+        _recordsToSave = [records copy];
+        _recordIDsToDelete = [recordIDs copy];
+    }
+    return self;
 }
 
+- (void)_performWithError:(NSError *)error
+{
+    if (_modifyRecordsCompletionBlock)
+        _modifyRecordsCompletionBlock(nil, nil, error);
+}
 @end

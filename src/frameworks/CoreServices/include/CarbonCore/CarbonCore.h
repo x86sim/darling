@@ -19,6 +19,7 @@
 
 #include <CarbonCore/Components.h>
 #include <CarbonCore/DateTimeUtils.h>
+#include <CarbonCore/Debugging.h>
 #include <CarbonCore/DriverServices.h>
 #include <CarbonCore/DriverSynchronization.h>
 #include <CarbonCore/Endian.h>
@@ -29,6 +30,7 @@
 #include <CarbonCore/Math64.h>
 #include <CarbonCore/Multiprocessing.h>
 #include <CarbonCore/MixedMode.h>
+#include <CarbonCore/Script.h>
 #include <CarbonCore/TextCommon.h>
 #include <CarbonCore/TextEncodingConverter.h>
 #include <CarbonCore/TextUtils.h>

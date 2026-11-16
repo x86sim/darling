@@ -1,6 +1,10 @@
+include(swift_dylib_map)
+
 FUNCTION(use_ld64 target)
 	set_property(TARGET ${target} APPEND_STRING PROPERTY
 		LINK_FLAGS " -fuse-ld=${CMAKE_BINARY_DIR}/src/external/cctools-port/cctools/ld64/src/${APPLE_TARGET_TRIPLET_PRIMARY}-ld ")
+
+	add_swift_dylib_map(${target})
 
 	if (COMPONENT_gui)
 		set(COCOTRON_FW_PATH "${CMAKE_BINARY_DIR}/src/external/cocotron")
@@ -31,6 +35,7 @@ FUNCTION(use_ld64 target)
 -Wl,-dylib_file,/usr/lib/system/libremovefile.dylib:${CMAKE_BINARY_DIR}/src/external/removefile/libremovefile.dylib \
 -Wl,-dylib_file,/usr/lib/system/libcopyfile.dylib:${CMAKE_BINARY_DIR}/src/external/copyfile/libcopyfile.dylib \
 -Wl,-dylib_file,/usr/lib/system/libsystem_coreservices.dylib:${CMAKE_BINARY_DIR}/src/libsystem_coreservices/libsystem_coreservices.dylib \
+-Wl,-dylib_file,/usr/lib/system/libsystem_featureflags.dylib:${CMAKE_BINARY_DIR}/src/libsystem_featureflags/libsystem_featureflags.dylib \
 -Wl,-dylib_file,/usr/lib/system/libsystem_notify.dylib:${CMAKE_BINARY_DIR}/src/external/libnotify/libsystem_notify_firstpass.dylib \
 -Wl,-dylib_file,/usr/lib/system/libdispatch.dylib:${CMAKE_BINARY_DIR}/src/external/libdispatch/liblibdispatch_shared_firstpass.dylib \
 -Wl,-dylib_file,/usr/lib/system/libmacho.dylib:${CMAKE_BINARY_DIR}/src/external/cctools/libmacho/libmacho_firstpass.dylib \
@@ -140,6 +145,7 @@ FUNCTION(use_ld64 target)
 -Wl,-dylib_file,/System/Library/Frameworks/CFOpenDirectory.framework/Versions/A/CFOpenDirectory:${CMAKE_BINARY_DIR}/src/frameworks/OpenDirectory/CFOpenDirectory/CFOpenDirectory \
 -Wl,-dylib_file,/usr/lib/libnetwork.dylib:${CMAKE_BINARY_DIR}/src/external/libnetwork/libnetwork.dylib \
 -Wl,-dylib_file,/usr/lib/system/libcache.dylib:${CMAKE_BINARY_DIR}/src/libcache/libcache.dylib \
+-Wl,-dylib_file,/System/Library/Frameworks/Carbon.framework/Versions/A/Frameworks/CarbonSound.framework/Versions/A/CarbonSound:${CMAKE_BINARY_DIR}/src/frameworks/Carbon/CarbonSound/CarbonSound \
 -Wl,-dylib_file,/System/Library/Frameworks/Carbon.framework/Versions/A/Frameworks/CommonPanels.framework/Versions/A/CommonPanels:${CMAKE_BINARY_DIR}/src/frameworks/Carbon/CommonPanels/CommonPanels \
 -Wl,-dylib_file,/System/Library/Frameworks/Carbon.framework/Versions/A/Frameworks/Help.framework/Versions/A/Help:${CMAKE_BINARY_DIR}/src/frameworks/Carbon/Help/Help \
 -Wl,-dylib_file,/System/Library/Frameworks/Carbon.framework/Versions/A/Frameworks/HIToolbox.framework/Versions/A/HIToolbox:${CMAKE_BINARY_DIR}/src/frameworks/Carbon/HIToolbox/HIToolbox \
@@ -153,6 +159,7 @@ FUNCTION(use_ld64 target)
 -Wl,-dylib_file,/System/Library/Frameworks/QuartzCore.framework/Versions/A/QuartzCore:${COCOTRON_FW_PATH}/QuartzCore/QuartzCore \
 -Wl,-dylib_file,/System/Library/Frameworks/OpenGL.framework/Versions/A/OpenGL:${CMAKE_BINARY_DIR}/src/frameworks/OpenGL/OpenGL \
 -Wl,-dylib_file,/System/Library/PrivateFrameworks/Onyx2D.framework/Versions/A/Onyx2D:${CMAKE_BINARY_DIR}/src/external/cocotron/Onyx2D/Onyx2D \
+-Wl,-dylib_file,/System/Library/PrivateFrameworks/CollectionViewCore.framework/Versions/A/CollectionViewCore:${CMAKE_BINARY_DIR}/src/external/cocotron/CollectionViewCore/CollectionViewCore \
 -Wl,-dylib_file,/System/Library/PrivateFrameworks/UIFoundation.framework/Versions/A/UIFoundation:${CMAKE_BINARY_DIR}/src/private-frameworks/UIFoundation/UIFoundation \
 -Wl,-dylib_file,/usr/lib/darling/libelfloader.dylib:${CMAKE_BINARY_DIR}/src/libelfloader/libelfloader.dylib \
 -Wl,-dylib_file,/usr/lib/native/libavcodec.dylib:${CMAKE_BINARY_DIR}/src/native/libavcodec.dylib \
@@ -177,6 +184,20 @@ FUNCTION(use_ld64 target)
 -Wl,-dylib_file,/usr/lib/native/libXRandR.dylib:${CMAKE_BINARY_DIR}/src/native/libXRandR.dylib")
 
 	add_dependencies(${target} ${APPLE_TARGET_TRIPLET_PRIMARY}-ld)
+
+	# Our ld64 cannot sign its output (-adhoc_codesign), so every image it links is signed
+	# right after the link, before anything (e.g. lipo) uses it. Universal outputs of the
+	# compiler driver get a signature in each slice. The identifier is the file name, unless
+	# the target's ADHOC_CODESIGN_IDENTIFIER property says otherwise.
+	if (ADHOC_CODESIGN)
+		add_custom_command(TARGET ${target} POST_BUILD
+			COMMAND $<TARGET_FILE:adhoc-sign>
+				"--identifier=$<TARGET_PROPERTY:${target},ADHOC_CODESIGN_IDENTIFIER>"
+				"$<TARGET_FILE:${target}>"
+			VERBATIM
+		)
+		add_dependencies(${target} adhoc-sign)
+	endif (ADHOC_CODESIGN)
 
 ENDFUNCTION(use_ld64)
 

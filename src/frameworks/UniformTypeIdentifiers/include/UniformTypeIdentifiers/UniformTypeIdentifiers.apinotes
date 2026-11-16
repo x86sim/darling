@@ -1,0 +1,40 @@
+# Copyright (C) 2026 Lubos Dolezel
+#
+# Swift API notes for the UniformTypeIdentifiers framework: how its Objective-C declarations import into Swift.
+# The class is UTTypeReference in Swift (the UTType struct of the Swift overlay wraps it), and its factory methods
+# are initializers, as in the documented Swift API.
+---
+Name: UniformTypeIdentifiers
+Classes:
+- Name: UTType
+  SwiftName: UTTypeReference
+  Methods:
+  - Selector: 'typeWithIdentifier:'
+    MethodKind: Class
+    SwiftName: 'init(_:)'
+  - Selector: 'typeWithTag:tagClass:conformingToType:'
+    MethodKind: Class
+    SwiftName: 'init(tag:tagClass:conformingTo:)'
+  - Selector: 'typesWithTag:tagClass:conformingToType:'
+    MethodKind: Class
+    SwiftName: 'types(tag:tagClass:conformingTo:)'
+  - Selector: 'exportedTypeWithIdentifier:'
+    MethodKind: Class
+    SwiftName: 'init(exportedAs:)'
+  - Selector: 'exportedTypeWithIdentifier:conformingToType:'
+    MethodKind: Class
+    SwiftName: 'init(exportedAs:conformingTo:)'
+  - Selector: 'importedTypeWithIdentifier:'
+    MethodKind: Class
+    SwiftName: 'init(importedAs:)'
+  - Selector: 'importedTypeWithIdentifier:conformingToType:'
+    MethodKind: Class
+    SwiftName: 'init(importedAs:conformingTo:)'
+  Properties:
+  - Name: publicType
+    PropertyKind: Instance
+    SwiftName: 'isPublic'
+  # NSObject has a class method version, which would hide the instance property from Swift.
+  - Name: version
+    PropertyKind: Instance
+    SwiftName: 'typeVersion'

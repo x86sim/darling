@@ -2435,14 +2435,45 @@ system_specific_bootstrap(bool sflag)
 		}
 	}
 
+#ifdef DARLING
+	// In Darling, these may be symlinks into the host's root filesystem (e.g. /private/tmp ->
+	// /Volumes/SystemRoot/tmp, so that sockets like PulseAudio's are shared with the host).
+	// Emptying them at container boot would delete the host user's files, including live
+	// sockets such as /tmp/.X11-unix/X0.
+	{
+		const char *boot_cleaned_dirs[] = { _PATH_VARRUN, _PATH_TMP };
+		for (size_t i = 0; i < sizeof(boot_cleaned_dirs) / sizeof(boot_cleaned_dirs[0]); i++) {
+			char resolved[PATH_MAX];
+			if (realpath(boot_cleaned_dirs[i], resolved) != NULL
+				&& (strncmp(resolved, "/Volumes/SystemRoot/", 20) == 0 || strcmp(resolved, "/Volumes/SystemRoot") == 0)) {
+				launchctl_log(LOG_NOTICE, "Not emptying %s: it is the host's %s", boot_cleaned_dirs[i], resolved + 19);
+				continue;
+			}
+			empty_dir(boot_cleaned_dirs[i], NULL);
+		}
+	}
+#else
 	empty_dir(_PATH_VARRUN, NULL);
 	empty_dir(_PATH_TMP, NULL);
+#endif
 	(void)remove(_PATH_NOLOGIN);
 
 	if (path_check("/usr/libexec/dirhelper")) {
 		const char *dirhelper_tool[] = { "/usr/libexec/dirhelper", "-machineBoot", NULL };
 		(void)posix_assumes_zero(fwexec(dirhelper_tool, NULL));
 	}
+
+#ifdef DARLING
+	/* Hand the platform identity and the security configuration to
+	 * darlingserver before any job is loaded, so that every job, including
+	 * those in /Library/LaunchDaemons, starts with them. A failure is logged
+	 * by darling-prefsd and darlingserver keeps its defaults. The
+	 * org.darlinghq.prefsd job pushes later changes. */
+	if (path_check("/usr/libexec/darling-prefsd")) {
+		const char *prefsd_tool[] = { "/usr/libexec/darling-prefsd", "--push-once", NULL };
+		(void)posix_assumes_zero(fwexec(prefsd_tool, NULL));
+	}
+#endif
 
 	(void)posix_assumes_zero(touch_file(_PATH_UTMPX, DEFFILEMODE));
 #if !TARGET_OS_EMBEDDED

@@ -1,7 +1,7 @@
 /*
  This file is part of Darling.
 
- Copyright (C) 2019 Lubos Dolezel
+ Copyright (C) 2026 Lubos Dolezel
 
  Darling is free software: you can redistribute it and/or modify
  it under the terms of the GNU General Public License as published by
@@ -17,18 +17,37 @@
  along with Darling.  If not, see <http://www.gnu.org/licenses/>.
 */
 
-#import <CloudKit/CKOperationConfiguration.h>
+#import "CKInternal.h"
 
 @implementation CKOperationConfiguration
 
-- (NSMethodSignature *)methodSignatureForSelector:(SEL)aSelector
+@synthesize container = _container;
+@synthesize qualityOfService = _qualityOfService;
+@synthesize allowsCellularAccess = _allowsCellularAccess;
+@synthesize longLived = _longLived;
+@synthesize timeoutIntervalForRequest = _timeoutIntervalForRequest;
+@synthesize timeoutIntervalForResource = _timeoutIntervalForResource;
+
+- (instancetype)init
 {
-    return [NSMethodSignature signatureWithObjCTypes: "v@:"];
+    if ((self = [super init])) {
+        _qualityOfService = NSQualityOfServiceDefault;
+        _allowsCellularAccess = YES;
+        _timeoutIntervalForRequest = 60;
+        _timeoutIntervalForResource = -1;
+    }
+    return self;
 }
 
-- (void)forwardInvocation:(NSInvocation *)anInvocation
+- (id)copyWithZone:(NSZone *)zone
 {
-    NSLog(@"Stub called: %@ in %@", NSStringFromSelector([anInvocation selector]), [self class]);
+    CKOperationConfiguration *copy = [[[self class] allocWithZone:zone] init];
+    copy->_container = _container;
+    copy->_qualityOfService = _qualityOfService;
+    copy->_allowsCellularAccess = _allowsCellularAccess;
+    copy->_longLived = _longLived;
+    copy->_timeoutIntervalForRequest = _timeoutIntervalForRequest;
+    copy->_timeoutIntervalForResource = _timeoutIntervalForResource;
+    return copy;
 }
-
 @end

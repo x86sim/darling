@@ -18,19 +18,35 @@
 */
 
 #import <ImageCaptureCore/ICCameraItem.h>
+#import <darling-stub-forwarding.h>
 
 ICDownloadOption const ICDownloadsDirectoryURL = @"ICDownloadsDirectoryURL";
+// Values observed on macOS 26 by printing the public constants (rung 4).
+ICDownloadOption const ICOverwrite = @"ICOverwrite";
+ICDownloadOption const ICSaveAsFilename = @"ICSaveAsFilename";
+ICDownloadOption const ICSavedFilename = @"ICSavedFilename";
+ICDownloadOption const ICDownloadSidecarFiles = @"ICDownloadSidecarFiles";
 
 @implementation ICCameraItem
 
 - (NSMethodSignature *)methodSignatureForSelector:(SEL)aSelector
 {
-    return [NSMethodSignature signatureWithObjCTypes: "v@:"];
+    return [super methodSignatureForSelector: aSelector] ?: DarlingStubMethodSignature(aSelector);
 }
 
 - (void)forwardInvocation:(NSInvocation *)anInvocation
 {
-    NSLog(@"Stub called: %@ in %@", NSStringFromSelector([anInvocation selector]), [self class]);
+    DarlingStubForwardInvocation(self, anInvocation);
+}
+
++ (NSMethodSignature *)methodSignatureForSelector:(SEL)aSelector
+{
+    return [super methodSignatureForSelector: aSelector] ?: DarlingStubMethodSignature(aSelector);
+}
+
++ (void)forwardInvocation:(NSInvocation *)anInvocation
+{
+    DarlingStubForwardInvocation(self, anInvocation);
 }
 
 @end

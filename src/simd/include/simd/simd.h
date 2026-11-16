@@ -16,11 +16,15 @@
  You should have received a copy of the GNU General Public License
  along with Darling.  If not, see <http://www.gnu.org/licenses/>.
 */
-
 #ifndef SIMD_H
 #define SIMD_H
 
-#include <simd/vector_make.h>
 #include <simd/vector_types.h>
+#include <simd/vector_make.h>
+#include <simd/common.h>
+#include <simd/geometry.h>
+#include <simd/matrix_types.h>
+#include <simd/matrix.h>
+#include <simd/quaternion.h>
 
 #endif

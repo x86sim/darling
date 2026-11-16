@@ -26,7 +26,7 @@
 #include "architecture/ppc/math.h"
 #elif (defined (__i386__) || defined( __x86_64__ ))
 #include "architecture/i386/math.h"
-#elif defined(__arm__)
+#elif defined(__arm__) || defined(__arm64__)
 #include "architecture/arm/math.h"
 #else
 #error Unknown architecture
@@ -39,5 +39,8 @@ extern struct __float2 __sincosf_stret(float v);
 extern struct __double2 __sincos_stret(double v);
 extern struct __float2 __sincospif_stret(float v);
 extern struct __double2 __sincospi_stret(double v);
+
+extern float __exp10f(float);
+extern double __exp10(double);
 
 #endif /* __MATH_H__ */

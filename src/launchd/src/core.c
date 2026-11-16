@@ -453,6 +453,8 @@ static void jobmgr_reap_bulk(jobmgr_t jm, struct kevent *kev);
 #ifdef DARLING
 static void darling_reap_strays(void);
 static int darling_reap_strays_timer;
+static void jobmgr_reap_orphans(void);
+static int orphan_reap_timer;
 #endif
 static void jobmgr_log_stray_children(jobmgr_t jm, bool kill_strays);
 static void jobmgr_kill_stray_children(jobmgr_t jm, pid_t *p, size_t np);
@@ -1733,6 +1735,7 @@ job_new_anonymous(jobmgr_t jm, pid_t anonpid)
 		return NULL;
 	}
 
+#ifndef DARLING
 	if (anonpid >= 100000) {
 		/* The kernel current defines PID_MAX to be 99999, but that define isn't
 		 * exported.
@@ -1741,6 +1744,13 @@ job_new_anonymous(jobmgr_t jm, pid_t anonpid)
 		errno = EINVAL;
 		return NULL;
 	}
+#else
+	if (anonpid >= 4194304) {
+		launchd_syslog(LOG_WARNING, "Did PID_MAX change? Got request from PID: %d", anonpid);
+		errno = EINVAL;
+		return NULL;
+	}
+#endif
 
 	/* libproc returns the number of bytes written into the buffer upon success,
 	 * zero on failure. I'd much rather it return -1 on failure, like sysctl(3).
@@ -3682,6 +3692,9 @@ job_reap(job_t j)
 		} else {
 			job_log(j, LOG_INFO, "Job was implicitly reaped by the kernel.");
 		}
+#ifdef DARLING
+		jobmgr_reap_orphans();
+#endif
 	}
 
 	if (j->exit_timeout) {
@@ -4319,6 +4332,21 @@ darling_reap_strays(void)
 		}
 	}
 	closedir(d);
+void
+jobmgr_reap_orphans(void)
+{
+	siginfo_t si;
+
+	for (;;) {
+		si.si_pid = 0;
+		if (waitid(P_ALL, 0, &si, WEXITED | WNOHANG | WNOWAIT) == -1 || si.si_pid == 0) {
+			break;
+		}
+		if (jobmgr_find_by_pid_deep(root_jobmgr, si.si_pid, false)) {
+			break;
+		}
+		(void)waitpid(si.si_pid, NULL, WNOHANG);
+	}
 }
 #endif
 
@@ -4390,6 +4418,10 @@ jobmgr_callback(void *obj, struct kevent *kev)
 			if (jobmgr_assumes_zero(jm, runtime_busy_cnt) == 0) {
 				return launchd_shutdown();
 			}
+#ifdef DARLING
+		} else if (kev->ident == (uintptr_t)&orphan_reap_timer) {
+			jobmgr_reap_orphans();
+#endif
 #if HAVE_SYSTEMSTATS
 		} else if (kev->ident == (uintptr_t)systemstats_timer_callback) {
 			systemstats_timer_callback();
@@ -6521,6 +6553,8 @@ job_setup_exception_port(job_t j, task_t target_task)
 	f = x86_THREAD_STATE;
 #elif defined(__arm__)
 	f = ARM_THREAD_STATE;
+#elif defined(__arm64__) || defined(__aarch64__)
+	f = ARM_THREAD_STATE64;
 #else
 #error "unknown architecture"
 #endif
@@ -6978,6 +7012,9 @@ jobmgr_new(jobmgr_t jm, mach_port_t requestorport, mach_port_t transfer_port, bo
 		(void)jobmgr_assumes_zero_p(jmr, kevent_mod(SIGUSR1, EVFILT_SIGNAL, EV_ADD, 0, 0, jmr));
 		(void)jobmgr_assumes_zero_p(jmr, kevent_mod(SIGUSR2, EVFILT_SIGNAL, EV_ADD, 0, 0, jmr));
 		(void)jobmgr_assumes_zero_p(jmr, kevent_mod(SIGINFO, EVFILT_SIGNAL, EV_ADD, 0, 0, jmr));
+#ifdef DARLING
+		(void)jobmgr_assumes_zero_p(jmr, kevent_mod((uintptr_t)&orphan_reap_timer, EVFILT_TIMER, EV_ADD, NOTE_SECONDS, 5, jmr));
+#endif
 		(void)jobmgr_assumes_zero_p(jmr, kevent_mod(0, EVFILT_FS, EV_ADD, VQ_MOUNT|VQ_UNMOUNT|VQ_UPDATE, 0, jmr));
 #ifdef DARLING
 		if (pid1_magic) {

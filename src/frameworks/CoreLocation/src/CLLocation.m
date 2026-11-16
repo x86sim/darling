@@ -18,17 +18,35 @@
 */
 
 #import <CoreLocation/CLLocation.h>
+#import <darling-stub-forwarding.h>
 
 @implementation CLLocation
 
 - (NSMethodSignature *)methodSignatureForSelector:(SEL)aSelector
 {
-    return [NSMethodSignature signatureWithObjCTypes: "v@:"];
+    return [super methodSignatureForSelector: aSelector] ?: DarlingStubMethodSignature(aSelector);
 }
 
 - (void)forwardInvocation:(NSInvocation *)anInvocation
 {
-    NSLog(@"Stub called: %@ in %@", NSStringFromSelector([anInvocation selector]), [self class]);
+    DarlingStubForwardInvocation(self, anInvocation);
+}
+
++ (NSMethodSignature *)methodSignatureForSelector:(SEL)aSelector
+{
+    return [super methodSignatureForSelector: aSelector] ?: DarlingStubMethodSignature(aSelector);
+}
+
++ (void)forwardInvocation:(NSInvocation *)anInvocation
+{
+    DarlingStubForwardInvocation(self, anInvocation);
 }
 
 @end
+
+const CLLocationAccuracy kCLLocationAccuracyBestForNavigation = -2.0;
+const CLLocationAccuracy kCLLocationAccuracyBest = -1.0;
+const CLLocationAccuracy kCLLocationAccuracyNearestTenMeters = 10.0;
+const CLLocationAccuracy kCLLocationAccuracyHundredMeters = 100.0;
+const CLLocationAccuracy kCLLocationAccuracyKilometer = 1000.0;
+const CLLocationAccuracy kCLLocationAccuracyThreeKilometers = 3000.0;

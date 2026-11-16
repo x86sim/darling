@@ -18,17 +18,58 @@
 */
 
 #import <OSAKit/OSAScriptElement.h>
+#import <darling-stub-forwarding.h>
 
 @implementation OSAScriptElement
 
+@synthesize range = _range;
+
+- (instancetype)initWithRange:(NSRange)range
+{
+    if ((self = [super init]))
+        _range = range;
+    return self;
+}
+
+// Only root elements exist (see -[OSAScriptParser parse]), so there are no children, title or name.
+- (NSArray *)subElements
+{
+    return [NSArray array];
+}
+
+- (NSRange)rangeOfSubElements
+{
+    return NSMakeRange(_range.location, 0);
+}
+
+- (NSString *)title
+{
+    return nil;
+}
+
+- (NSRange)nameRange
+{
+    return NSMakeRange(_range.location, 0);
+}
+
 - (NSMethodSignature *)methodSignatureForSelector:(SEL)aSelector
 {
-    return [NSMethodSignature signatureWithObjCTypes: "v@:"];
+    return [super methodSignatureForSelector: aSelector] ?: DarlingStubMethodSignature(aSelector);
 }
 
 - (void)forwardInvocation:(NSInvocation *)anInvocation
 {
-    NSLog(@"Stub called: %@ in %@", NSStringFromSelector([anInvocation selector]), [self class]);
+    DarlingStubForwardInvocation(self, anInvocation);
+}
+
++ (NSMethodSignature *)methodSignatureForSelector:(SEL)aSelector
+{
+    return [super methodSignatureForSelector: aSelector] ?: DarlingStubMethodSignature(aSelector);
+}
+
++ (void)forwardInvocation:(NSInvocation *)anInvocation
+{
+    DarlingStubForwardInvocation(self, anInvocation);
 }
 
 @end

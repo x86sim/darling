@@ -22,9 +22,11 @@ add_framework(HIToolbox
 		src/Events.cpp
 		src/CarbonEventsCore.c
 		src/CarbonEvents.c
+		src/CarbonEventTargets.c
 		src/MacApplication.cpp
 		src/MacWindows.cpp
 		src/TextInputSources.mm
+		src/TextServices.c
 		src/IBCarbonRuntime.c
 		src/HITheme.c
 		src/constants.c
@@ -32,5 +34,8 @@ add_framework(HIToolbox
 	DEPENDENCIES
 		CoreFoundation
 		Foundation
+		CoreGraphics
+		CoreServices
 		system
+		cxx
 )

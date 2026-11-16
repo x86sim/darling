@@ -1,7 +1,7 @@
 /*
  This file is part of Darling.
 
- Copyright (C) 2019 Lubos Dolezel
+ Copyright (C) 2026 Lubos Dolezel
 
  Darling is free software: you can redistribute it and/or modify
  it under the terms of the GNU General Public License as published by
@@ -17,18 +17,31 @@
  along with Darling.  If not, see <http://www.gnu.org/licenses/>.
 */
 
-#import <CloudKit/CKDiscoverUserIdentitiesOperation.h>
+#import "CKInternal.h"
 
 @implementation CKDiscoverUserIdentitiesOperation
 
-- (NSMethodSignature *)methodSignatureForSelector:(SEL)aSelector
+@synthesize userIdentityLookupInfos = _userIdentityLookupInfos;
+@synthesize userIdentityDiscoveredBlock = _userIdentityDiscoveredBlock;
+@synthesize discoverUserIdentitiesCompletionBlock = _discoverUserIdentitiesCompletionBlock;
+
+- (instancetype)init
 {
-    return [NSMethodSignature signatureWithObjCTypes: "v@:"];
+    if ((self = [super init]))
+        _userIdentityLookupInfos = @[];
+    return self;
 }
 
-- (void)forwardInvocation:(NSInvocation *)anInvocation
+- (instancetype)initWithUserIdentityLookupInfos:(NSArray<CKUserIdentityLookupInfo *> *)userIdentityLookupInfos
 {
-    NSLog(@"Stub called: %@ in %@", NSStringFromSelector([anInvocation selector]), [self class]);
+    if ((self = [self init]))
+        _userIdentityLookupInfos = [userIdentityLookupInfos copy];
+    return self;
 }
 
+- (void)_performWithError:(NSError *)error
+{
+    if (_discoverUserIdentitiesCompletionBlock)
+        _discoverUserIdentitiesCompletionBlock(error);
+}
 @end

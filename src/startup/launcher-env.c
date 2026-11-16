@@ -1,0 +1,131 @@
+/*
+This file is part of Darling.
+
+Copyright (C) 2026 Lubos Dolezel
+
+Darling is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+Darling is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with Darling.  If not, see <http://www.gnu.org/licenses/>.
+*/
+
+#include <stdlib.h>
+#include <string.h>
+#include "launcher-env.h"
+
+// What darlingserver reads from its environment, and why each is safe to take
+// from the invoking user:
+static const char* const serverEnvAllowlist[] = {
+	// Where /Users/<name>/LinuxHome points and where the user's
+	// user-dirs.dirs is found; both are used with the user's ids.
+	"HOME",
+	"XDG_CONFIG_HOME",
+	// Selects the copy mode, which the user can also select by writing the
+	// prefix's .darling-fsmode file.
+	"DARLING_NOOVERLAYFS",
+	// The guest init program; it is started after the server has dropped to
+	// the user's ids, inside the container.
+	"DSERVER_INIT",
+	// Logging switches; the log goes to the prefix or to standard error.
+	"DSERVER_LOG_LEVEL",
+	"DSERVER_LOG_STDERR",
+	"DTAPE_LOG_SAFE_STUBS",
+	// WSL 1 detection, which selects workarounds for its kernel.
+	"WSLENV",
+	"WSL_INTEROP",
+	// The host session's display server, for the container's launchd and
+	// every job it starts (daemons such as iokitd, and applications started
+	// through launchd). They are only names and paths that are opened later
+	// with the user's ids, in the container, which the user owns; darlingserver
+	// itself never reads them.
+	"DISPLAY",
+	"WAYLAND_DISPLAY",
+	"XAUTHORITY",
+	// Where a Wayland socket named by a relative WAYLAND_DISPLAY lives.
+	"XDG_RUNTIME_DIR",
+	// The host's D-Bus session bus, for the container's daemons that talk to the
+	// desktop (usernoted posts notifications there). It is an address that is
+	// connected to later with the user's ids, in the container; darlingserver
+	// itself never reads it. Without it, a daemon can only guess the usual
+	// $XDG_RUNTIME_DIR/bus, which fails when the session bus lives elsewhere.
+	"DBUS_SESSION_BUS_ADDRESS",
+	// The host's PulseAudio server and cookie, as the user chose them or as the launcher found them for
+	// a host without XDG_RUNTIME_DIR. Like the display variables they are paths and addresses that the
+	// container's own processes use with the user's ids; darlingserver never reads them.
+	"PULSE_SERVER",
+	"PULSE_RUNTIME_PATH",
+	"PULSE_COOKIE",
+};
+
+bool launcherEnvEntryIs(const char* entry, const char* name)
+{
+	size_t len = strlen(name);
+
+	return strncmp(entry, name, len) == 0 && entry[len] == '=';
+}
+
+// Read by the host dynamic loader.
+static const char* const hostLoaderVariables[] = {
+	"LD_LIBRARY_PATH",
+	"LD_PRELOAD",
+};
+
+bool launcherGuestMayGet(const char* entry)
+{
+	const char* equals = strchr(entry, '=');
+
+	// NAME=value with a non-empty name.
+	if (equals == NULL || equals == entry)
+		return false;
+
+	for (size_t i = 0; i < sizeof(hostLoaderVariables) / sizeof(hostLoaderVariables[0]); i++)
+	{
+		if (launcherEnvEntryIs(entry, hostLoaderVariables[i]))
+			return false;
+	}
+	return true;
+}
+
+static bool serverMayGet(const char* entry)
+{
+	for (size_t i = 0; i < sizeof(serverEnvAllowlist) / sizeof(serverEnvAllowlist[0]); i++)
+	{
+		if (launcherEnvEntryIs(entry, serverEnvAllowlist[i]))
+			return true;
+	}
+	return false;
+}
+
+char** launcherServerEnvironment(char* const* envp, bool restricted)
+{
+	size_t count = 0, n = 0;
+	char** result;
+
+	while (envp[count] != NULL)
+		count++;
+
+	// One more for PATH and one for the terminating NULL.
+	result = malloc(sizeof(char*) * (count + 2));
+	if (!result)
+		return NULL;
+
+	if (restricted)
+		result[n++] = (char*) LAUNCHER_SERVER_PATH;
+
+	for (size_t i = 0; i < count; i++)
+	{
+		if (restricted ? serverMayGet(envp[i]) : launcherGuestMayGet(envp[i]))
+			result[n++] = envp[i];
+	}
+	result[n] = NULL;
+
+	return result;
+}

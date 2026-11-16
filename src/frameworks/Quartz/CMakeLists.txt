@@ -60,5 +60,9 @@ reexport(Quartz QuickLook ${QuickLook_BUILD})
 reexport(Quartz ImageKit ${ImageKit_BUILD})
 reexport(Quartz QuartzComposer ${QuartzComposer_BUILD})
 reexport(Quartz QuartzFilters ${QuartzFilters_BUILD})
-reexport(Quartz PDFKit ${PDFKit_BUILD})
+# PDFKit is built with the other stubbed frameworks (gui_stubs), which is not part of every
+# component set that builds Quartz (cli_dev, for one).
+if (COMPONENT_gui_stubs)
+	reexport(Quartz PDFKit ${PDFKit_BUILD})
+endif()
 reexport(Quartz QuartzCore ${QuartzCore_BUILD})

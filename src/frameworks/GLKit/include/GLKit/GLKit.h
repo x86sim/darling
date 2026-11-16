@@ -53,13 +53,8 @@
 #import <GLKit/GLKTexture.h>
 #import <GLKit/GLKTextureInfo.h>
 #import <GLKit/GLKTextureLoader.h>
+#import <GLKit/GLKMath.h>
 
-void* GLKMathProject(void);
-void* GLKMathUnproject(void);
-void* GLKMatrix3Invert(void);
-void* GLKMatrix3InvertAndTranspose(void);
-void* GLKMatrix4Invert(void);
-void* GLKMatrix4InvertAndTranspose(void);
 void* GLKMatrixStackCreate(void);
 void* GLKMatrixStackGetMatrix2(void);
 void* GLKMatrixStackGetMatrix3(void);
@@ -88,13 +83,6 @@ void* GLKMatrixStackSize(void);
 void* GLKMatrixStackTranslate(void);
 void* GLKMatrixStackTranslateWithVector3(void);
 void* GLKMatrixStackTranslateWithVector4(void);
-void* GLKQuaternionAngle(void);
-void* GLKQuaternionAxis(void);
-void* GLKQuaternionMakeWithMatrix3(void);
-void* GLKQuaternionMakeWithMatrix4(void);
-void* GLKQuaternionRotateVector3Array(void);
-void* GLKQuaternionRotateVector4Array(void);
-void* GLKQuaternionSlerp(void);
 void* GLKVertexAttributeParametersFromModelIO(void);
 void* NSStringFromGLKMatrix2(void);
 void* NSStringFromGLKMatrix3(void);

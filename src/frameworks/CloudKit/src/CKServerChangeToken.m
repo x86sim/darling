@@ -1,7 +1,7 @@
 /*
  This file is part of Darling.
 
- Copyright (C) 2019 Lubos Dolezel
+ Copyright (C) 2026 Lubos Dolezel
 
  Darling is free software: you can redistribute it and/or modify
  it under the terms of the GNU General Public License as published by
@@ -17,18 +17,60 @@
  along with Darling.  If not, see <http://www.gnu.org/licenses/>.
 */
 
-#import <CloudKit/CKServerChangeToken.h>
+#import "CKInternal.h"
 
+// Opaque to applications; the contents are whatever the server handed out.
 @implementation CKServerChangeToken
 
-- (NSMethodSignature *)methodSignatureForSelector:(SEL)aSelector
++ (BOOL)supportsSecureCoding
 {
-    return [NSMethodSignature signatureWithObjCTypes: "v@:"];
+    return YES;
 }
 
-- (void)forwardInvocation:(NSInvocation *)anInvocation
+- (instancetype)_initWithData:(NSData *)data
 {
-    NSLog(@"Stub called: %@ in %@", NSStringFromSelector([anInvocation selector]), [self class]);
+    if ((self = [super init]))
+        _data = [data copy];
+    return self;
+}
+
+- (instancetype)initWithCoder:(NSCoder *)coder
+{
+    NSData *data = [coder decodeObjectOfClass:[NSData class] forKey:@"Data"];
+    if (data == nil) {
+        return nil;
+    }
+    return [self _initWithData:data];
+}
+
+- (void)encodeWithCoder:(NSCoder *)coder
+{
+    [coder encodeObject:_data forKey:@"Data"];
+}
+
+- (id)copyWithZone:(NSZone *)zone
+{
+    // Immutable.
+    return self;
+}
+
+- (NSData *)_data
+{
+    return _data;
+}
+
+- (BOOL)isEqual:(id)object
+{
+    if (self == object)
+        return YES;
+    if (![object isKindOfClass:[CKServerChangeToken class]])
+        return NO;
+    return [_data isEqualToData:(((CKServerChangeToken *)object))->_data];
+}
+
+- (NSUInteger)hash
+{
+    return _data.hash;
 }
 
 @end

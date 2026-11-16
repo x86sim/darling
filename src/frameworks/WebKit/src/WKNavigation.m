@@ -18,15 +18,52 @@
 */
 
 #import <WebKit/WKNavigation.h>
+#import "WKWebViewBackend.h"
+#import "WKStubForwarding.h"
+
+// The new implementation is 64-bit only, like WebKit2 on macOS; the 32-bit slice keeps the stub.
+#if __LP64__
+
+@implementation WKNavigation {
+    NSURLRequest *_request;
+    NSData *_contentData;
+    NSString *_contentMIMEType;
+    NSString *_contentEncodingName;
+}
+
+@synthesize request = _request;
+@synthesize contentData = _contentData;
+@synthesize contentMIMEType = _contentMIMEType;
+@synthesize contentEncodingName = _contentEncodingName;
+
+- (instancetype)initWithRequest:(NSURLRequest *)request {
+    return [self initWithRequest:request contentData:nil MIMEType:nil encodingName:nil];
+}
+
+- (instancetype)initWithRequest:(NSURLRequest *)request contentData:(NSData *)data MIMEType:(NSString *)MIMEType encodingName:(NSString *)encodingName {
+    if ((self = [super init])) {
+        _request = [request copy];
+        _contentData = [data copy];
+        _contentMIMEType = [MIMEType copy];
+        _contentEncodingName = [encodingName copy];
+    }
+    return self;
+}
+
+WK_FORWARD_UNIMPLEMENTED_SELECTORS
+
+@end
+
+#else
+
+// The properties and methods of the public headers have no implementation in the 32-bit stub.
+#pragma clang diagnostic ignored "-Wobjc-property-implementation"
+#pragma clang diagnostic ignored "-Wincomplete-implementation"
 
 @implementation WKNavigation
 
-- (NSMethodSignature *)methodSignatureForSelector:(SEL)aSelector {
-    return [NSMethodSignature signatureWithObjCTypes: "v@:"];
-}
-
-- (void)forwardInvocation:(NSInvocation *)anInvocation {
-    NSLog(@"Stub called: %@ in %@", NSStringFromSelector([anInvocation selector]), [self class]);
-}
+WK_FORWARD_UNIMPLEMENTED_SELECTORS
 
 @end
+
+#endif

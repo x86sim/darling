@@ -33,45 +33,15 @@ static void initme(void) {
 
 // These stubs should prob be moved elsewhere
 
-OSErr ActivateTSMDocument(TSMDocumentID a)
-{
-    if (verbose) puts("STUB: ActivateTSMDocument called");
-	return 0;
-}
-
-OSErr DeactivateTSMDocument(TSMDocumentID a)
-{
-    if (verbose) puts("STUB: DeactivateTSMDocument called");
-	return 0;
-}
-
 OSStatus CreateStandardAlert(AlertType a, CFStringRef b, CFStringRef c, const AlertStdCFStringAlertParamRec * d, DialogRef * e)
 {
     if (verbose) puts("STUB: CreateStandardAlert called");
 	return 0;
 }
 
-OSErr UseInputWindow(TSMDocumentID a, Boolean b)
-{
-    if (verbose) puts("STUB: UseInputWindow called");
-	return 0;
-}
-
 void FlushEvents(EventMask a, EventMask b)
 {
     if (verbose) puts("STUB: FlushEvents called");
-}
-
-EventTargetRef GetApplicationEventTarget(void)
-{
-    if (verbose) puts("STUB: GetApplicationEventTarget called");
-	return (EventTargetRef)0;
-}
-
-OSStatus GetEventDispatcherTarget()
-{
-    if (verbose) puts("STUB: GetEventDispatcherTarget called");
-	return 0;
 }
 
 OSStatus GetScrapByName(CFStringRef a, OptionBits b, ScrapRef * c)
@@ -110,12 +80,6 @@ OSErr NMInstall(NMRecPtr a)
 	return 0;
 }
 
-OSErr NewTSMDocument(short a, InterfaceTypeList b, TSMDocumentID * c, long d)
-{
-    if (verbose) puts("STUB: NewTSMDocument called");
-	return 0;
-}
-
 OSStatus ProcessHICommand(const HICommand * a)
 {
     if (verbose) puts("STUB: ProcessHICommand called");
@@ -143,12 +107,6 @@ OSStatus RunStandardAlert(DialogRef a, ModalFilterUPP b, DialogItemIndex * c)
 OSStatus SetEventMask(EventMask a)
 {
     if (verbose) puts("STUB: SetEventMask called");
-	return 0;
-}
-
-OSStatus SetEventParameter(EventRef a, EventParamName b, EventParamType c, UInt32 d, const void * e)
-{
-    if (verbose) puts("STUB: SetEventParameter called");
 	return 0;
 }
 

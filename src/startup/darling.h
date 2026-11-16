@@ -60,6 +60,10 @@ pid_t getInitProcess(void);
 
 pid_t spawnInitProcess(void);
 
+// Asks the user how to set up the prefix after the current mode failed and records the answer
+// in the prefix. Returns nonzero if a mode was chosen; exits if none was.
+int chooseFsMode(void);
+
 void putInitPid(pid_t pidInit);
 void mapUids(pid_t pid);
 
@@ -67,11 +71,15 @@ void spawnLaunchd(void);
 void darlingPreInit(void);
 
 void checkPrefixOwner(void);
+void ensureSystemAccounts(void);
+void ensureZoneinfoLink(void);
+void ensureGlobalPreferences(void);
 
 int isModuleLoaded(void);
 
 void loadKernelModule(void);
-void joinNamespace(pid_t pid, int type, const char* typeName);
+// Joins the checked mount namespace of the container's darlingserver
+void joinServerMountNamespace(pid_t pid);
 
 void setupCoredumpPattern(void);
 void setupUserHome(void);

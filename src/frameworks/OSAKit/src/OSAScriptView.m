@@ -18,17 +18,51 @@
 */
 
 #import <OSAKit/OSAScriptView.h>
+#import "OSAKitPrivate.h"
+#import <darling-stub-forwarding.h>
 
 @implementation OSAScriptView
 
+@synthesize usesScriptAssistant = _usesScriptAssistant;
+@synthesize usesTabs = _usesTabs;
+@synthesize tabWidth = _tabWidth;
+@synthesize wrapsLines = _wrapsLines;
+@synthesize indentsWrappedLines = _indentsWrappedLines;
+@synthesize indentWidth = _indentWidth;
+
+- (OSAScriptAssistant *)scriptAssistant
+{
+    return nil;
+}
+
+- (NSString *)source
+{
+    return [[[self string] copy] autorelease];
+}
+
+- (void)setSource:(NSString *)source
+{
+    [self setString:source ?: @""];
+}
+
 - (NSMethodSignature *)methodSignatureForSelector:(SEL)aSelector
 {
-    return [NSMethodSignature signatureWithObjCTypes: "v@:"];
+    return [super methodSignatureForSelector: aSelector] ?: DarlingStubMethodSignature(aSelector);
 }
 
 - (void)forwardInvocation:(NSInvocation *)anInvocation
 {
-    NSLog(@"Stub called: %@ in %@", NSStringFromSelector([anInvocation selector]), [self class]);
+    DarlingStubForwardInvocation(self, anInvocation);
+}
+
++ (NSMethodSignature *)methodSignatureForSelector:(SEL)aSelector
+{
+    return [super methodSignatureForSelector: aSelector] ?: DarlingStubMethodSignature(aSelector);
+}
+
++ (void)forwardInvocation:(NSInvocation *)anInvocation
+{
+    DarlingStubForwardInvocation(self, anInvocation);
 }
 
 @end

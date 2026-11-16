@@ -8,6 +8,7 @@
 #include <unistd.h>
 #include "elfcalls.h"
 #include "threads.h"
+#include "native_fork.h"
 #include <sys/un.h>
 #include <sys/socket.h>
 #include <fcntl.h>
@@ -66,6 +67,7 @@ extern void __mldr_close_rpc_socket(int socket);
 
 extern int __mldr_create_process_lifetime_pipe(int* fds);
 extern void __mldr_close_process_lifetime_pipe(int fd);
+extern int __mldr_inherited_nofile_limit(unsigned int limits[2]);
 extern int __dserver_process_lifetime_pipe_fd;
 
 static int __dserver_get_process_lifetime_pipe() {
@@ -133,4 +135,8 @@ void elfcalls_make(struct elf_calls* calls)
 	calls->dserver_process_lifetime_pipe_refresh = __dserver_process_lifetime_pipe_refresh;
 	calls->postfork_child = __mldr_socket_bitmap_postfork_child;  // x86Sim: see elfcalls.h
 	calls->dserver_close_process_lifetime_pipe = __mldr_close_process_lifetime_pipe;
+
+	calls->native_fork = __mldr_native_fork;
+
+	calls->inherited_nofile_limit = __mldr_inherited_nofile_limit;
 }

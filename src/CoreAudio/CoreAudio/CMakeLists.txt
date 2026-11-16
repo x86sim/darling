@@ -7,8 +7,13 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++17")
 set(coreaudio_sources
 	AudioHardware.cpp
     AudioHardwareImpl.cpp
+    AudioHardwareListenerRegistry.cpp
+    AudioObjectListenerBlocks.cpp
+    CATapDescription.m
     HostTime.mm
     pulse/AudioHardwareImplPA.cpp
+    pulse/AudioHardwareImplPADevice.cpp
+    pulse/PADeviceRegistry.cpp
     pulse/AudioHardwareImplPAInput.cpp
     pulse/AudioHardwareImplPAOutput.cpp
     AudioHardwareStream.cpp
@@ -30,5 +35,6 @@ add_framework(CoreAudio
         system
         cxx
         CoreFoundation
+        Foundation
         pulse
 )

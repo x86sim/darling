@@ -191,3 +191,19 @@ int socket_bitmap_place(socket_bitmap_t* bitmap, int fd) {
 		close(placed);
 	}
 };
+
+void socket_bitmap_fork_prepare(socket_bitmap_t* bitmap) {
+	// Serialize with bitmap updates before taking the fork snapshot.
+	pthread_mutex_lock(&bitmap->mutex);
+}
+
+void socket_bitmap_fork_parent(socket_bitmap_t* bitmap) {
+	pthread_mutex_unlock(&bitmap->mutex);
+}
+
+void socket_bitmap_fork_child(socket_bitmap_t* bitmap) {
+	// x86Sim: a fresh mutex rather than an unlock. This also runs as elfcalls' postfork_child after the raw fork
+	// syscall (sys_fork), where no prepare step took the lock and another thread of the parent may have held it.
+	// The bitmap itself is never reallocated (see socket_bitmap_get), so there is no allocator state to repair.
+	pthread_mutex_init(&bitmap->mutex, NULL);
+}

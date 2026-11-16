@@ -108,8 +108,6 @@ void* CLGetLocationDefault(void);
 void* CLGetStatusBarIconState(void);
 void* CLInternalPerformMigration(void);
 void* CLLocationCoordinate2DGetDistanceFrom(void);
-void* CLLocationCoordinate2DIsValid(void);
-void* CLLocationCoordinate2DMake(void);
 void* CLPingDaemon(void);
 void* CLSetLocationDefault(void);
 void* CLSetMapMatchingRouteHint(void);

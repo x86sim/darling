@@ -2,12 +2,12 @@
 #define	AUDIOQUEUEBASE_H
 #include "AudioQueue.h"
 
-class AudioQueue
+struct OpaqueAudioQueue
 {
 public:
-	AudioQueue(const AudioStreamBasicDescription* format, void* userData,
+	OpaqueAudioQueue(const AudioStreamBasicDescription* format, void* userData,
 			CFRunLoopRef runloop, CFStringRef runloopMode, UInt32 flags);
-	virtual ~AudioQueue();
+	virtual ~OpaqueAudioQueue();
 	
 	virtual OSStatus start(const AudioTimeStamp *inStartTime) = 0;
 	virtual OSStatus prime(UInt32 inNumberOfFramesToPrepare, UInt32 *outNumberOfFramesPrepared) = 0;
@@ -27,6 +27,11 @@ public:
 
 	OSStatus addPropertyListener(AudioQueuePropertyID inID, AudioQueuePropertyListenerProc inProc, void *inUserData);
 	OSStatus removePropertyListener(AudioQueuePropertyID inID, AudioQueuePropertyListenerProc inProc, void *inUserData);
+
+	virtual OSStatus allocateBuffer(UInt32 inBufferByteSize, UInt32 inNumberPacketDescriptions, AudioQueueBufferRef *outBuffer);
+	virtual OSStatus freeBuffer(AudioQueueBufferRef inBuffer);
+	virtual OSStatus enqueueBuffer(AudioQueueBufferRef inBuffer, UInt32 inNumPacketDescs, const AudioStreamPacketDescription *inPacketDescs);
+	virtual OSStatus getCurrentTime(AudioTimeStamp *outTimeStamp, Boolean *outTimelineDiscontinuity);
 
 	virtual OSStatus setOfflineRenderFormat(const AudioStreamBasicDescription *inFormat, const AudioChannelLayout *inLayout) = 0;
 	virtual OSStatus offlineRender(const AudioTimeStamp *inTimestamp, AudioQueueBufferRef ioBuffer, UInt32 inNumberFrames) = 0;

@@ -19,6 +19,12 @@
 
 #import <IOSurface/IOSurface.h>
 #import <IOSurface/IOSurfaceObjC.h>
+#include <xpc/private/mach_send.h>
+
+@interface IOSurface (CopyingAttachments)
+- (nullable id)_copyAttachmentForKey:(NSString *)key;
+- (NSDictionary<NSString *, id> *)_copyAllAttachments;
+@end
 
 CFTypeID IOSurfaceGetTypeID(void)
 {
@@ -30,26 +36,39 @@ IOSurfaceRef _Nullable IOSurfaceCreate(CFDictionaryRef properties)
 	return (IOSurfaceRef) [[IOSurface alloc] initWithProperties: (NSDictionary*) properties];
 }
 
+IOSurfaceRef _Nullable IOSurfaceLookup(IOSurfaceID csid)
+{
+	return (IOSurfaceRef) [[IOSurface alloc] initWithSurfaceID: csid];
+}
+
+mach_port_t IOSurfaceCreateMachPort(IOSurfaceRef buffer)
+{
+	return [(IOSurface*)buffer createMachPort];
+}
+
 IOSurfaceRef _Nullable IOSurfaceLookupFromMachPort(mach_port_t port)
 {
 	return (IOSurfaceRef) [[IOSurface alloc] initWithMachPort: port];
 }
 
+// The XPC object carries the surface's Mach port.
 xpc_object_t IOSurfaceCreateXPCObject(IOSurfaceRef surface)
 {
-	return 0;
+	mach_port_t port = IOSurfaceCreateMachPort(surface);
+	if (!MACH_PORT_VALID(port))
+		return NULL;
+
+	xpc_object_t object = xpc_mach_send_create_with_disposition(port, MACH_MSG_TYPE_MOVE_SEND);
+	if (!object)
+		mach_port_deallocate(mach_task_self(), port);
+	return object;
 }
 
 IOSurfaceRef IOSurfaceLookupFromXPCObject(xpc_object_t obj)
 {
-#if NOTYET
-	if (xpc_get_type(obj) == _xpc_type_mach_send)
-	{
-		mach_port_t port = xpc_mach_send_get_right(obj);
-		return IOSurfaceLookupFromMachPort(port);
-	}
-#endif
-	return NULL;
+	if (!obj || xpc_get_type(obj) != XPC_TYPE_MACH_SEND)
+		return NULL;
+	return IOSurfaceLookupFromMachPort(xpc_mach_send_get_right(obj));
 }
 
 kern_return_t IOSurfaceLock(IOSurfaceRef buffer, IOSurfaceLockOptions options, uint32_t * _Nullable seed)
@@ -90,7 +109,7 @@ void IOSurfaceSetValue(IOSurfaceRef buffer, CFStringRef key, CFTypeRef value)
 
 CFTypeRef _Nullable IOSurfaceCopyValue(IOSurfaceRef buffer, CFStringRef key)
 {
-	return (CFTypeRef) [[(IOSurface*) buffer attachmentForKey: (NSString*) key] retain];
+	return (CFTypeRef) [(IOSurface*) buffer _copyAttachmentForKey: (NSString*) key];
 }
 
 
@@ -108,7 +127,7 @@ void IOSurfaceSetValues(IOSurfaceRef buffer, CFDictionaryRef keysAndValues)
 
 CFDictionaryRef _Nullable IOSurfaceCopyAllValues(IOSurfaceRef buffer)
 {
-	return (CFDictionaryRef) [[(IOSurface*)buffer allAttachments] retain];
+	return (CFDictionaryRef) [(IOSurface*)buffer _copyAllAttachments];
 }
 
 
@@ -198,13 +217,42 @@ size_t IOSurfaceGetBytesPerElement(IOSurfaceRef buffer)
 
 size_t IOSurfaceGetElementWidth(IOSurfaceRef buffer)
 {
-	return [(IOSurface*)buffer widthOfPlaneAtIndex: 0];
+	return [(IOSurface*)buffer elementWidthOfPlaneAtIndex: 0];
 }
 
 
 size_t IOSurfaceGetElementHeight(IOSurfaceRef buffer)
 {
-	return [(IOSurface*)buffer heightOfPlaneAtIndex: 0];
+	return [(IOSurface*)buffer elementHeightOfPlaneAtIndex: 0];
+}
+
+size_t IOSurfaceGetAllocSize(IOSurfaceRef buffer)
+{
+	return [(IOSurface*)buffer allocationSize];
+}
+
+// Darling's allocation constraints, not values taken from macOS: rows and
+// planes start on 64-byte boundaries and allocations are whole pages.
+size_t IOSurfaceGetPropertyAlignment(CFStringRef property)
+{
+	if (!property)
+		return 1;
+	if (CFEqual(property, kIOSurfaceAllocSize))
+		return 4096;
+	if (CFEqual(property, kIOSurfaceBytesPerRow) || CFEqual(property, kIOSurfacePlaneBytesPerRow)
+		|| CFEqual(property, kIOSurfacePlaneOffset) || CFEqual(property, kIOSurfacePlaneSize)
+		|| CFEqual(property, kIOSurfaceOffset))
+		return 64;
+	return 1;
+}
+
+// Rounds value up to the alignment of property. Returns 0 if that overflows.
+size_t IOSurfaceAlignProperty(CFStringRef property, size_t value)
+{
+	size_t alignment = IOSurfaceGetPropertyAlignment(property);
+	if (value > SIZE_MAX - (alignment - 1))
+		return 0;
+	return (value + alignment - 1) / alignment * alignment;
 }
 
 Boolean IOSurfaceIsInUse(IOSurfaceRef buffer)
@@ -215,4 +263,9 @@ Boolean IOSurfaceIsInUse(IOSurfaceRef buffer)
 kern_return_t IOSurfaceSetPurgeable(IOSurfaceRef buffer, uint32_t newState, uint32_t * _Nullable oldState)
 {
 	return [(IOSurface*)buffer setPurgeable:newState oldState:oldState];
+}
+
+Boolean IOSurfaceAllowsPixelSizeCasting(IOSurfaceRef buffer)
+{
+	return [(IOSurface*)buffer allowsPixelSizeCasting];
 }

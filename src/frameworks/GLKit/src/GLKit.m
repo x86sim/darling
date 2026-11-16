@@ -29,42 +29,6 @@ static void initme(void) {
     verbose = getenv("STUB_VERBOSE") != NULL;
 }
 
-void* GLKMathProject(void)
-{
-    if (verbose) puts("STUB: GLKMathProject called");
-    return NULL;
-}
-
-void* GLKMathUnproject(void)
-{
-    if (verbose) puts("STUB: GLKMathUnproject called");
-    return NULL;
-}
-
-void* GLKMatrix3Invert(void)
-{
-    if (verbose) puts("STUB: GLKMatrix3Invert called");
-    return NULL;
-}
-
-void* GLKMatrix3InvertAndTranspose(void)
-{
-    if (verbose) puts("STUB: GLKMatrix3InvertAndTranspose called");
-    return NULL;
-}
-
-void* GLKMatrix4Invert(void)
-{
-    if (verbose) puts("STUB: GLKMatrix4Invert called");
-    return NULL;
-}
-
-void* GLKMatrix4InvertAndTranspose(void)
-{
-    if (verbose) puts("STUB: GLKMatrix4InvertAndTranspose called");
-    return NULL;
-}
-
 void* GLKMatrixStackCreate(void)
 {
     if (verbose) puts("STUB: GLKMatrixStackCreate called");
@@ -230,48 +194,6 @@ void* GLKMatrixStackTranslateWithVector3(void)
 void* GLKMatrixStackTranslateWithVector4(void)
 {
     if (verbose) puts("STUB: GLKMatrixStackTranslateWithVector4 called");
-    return NULL;
-}
-
-void* GLKQuaternionAngle(void)
-{
-    if (verbose) puts("STUB: GLKQuaternionAngle called");
-    return NULL;
-}
-
-void* GLKQuaternionAxis(void)
-{
-    if (verbose) puts("STUB: GLKQuaternionAxis called");
-    return NULL;
-}
-
-void* GLKQuaternionMakeWithMatrix3(void)
-{
-    if (verbose) puts("STUB: GLKQuaternionMakeWithMatrix3 called");
-    return NULL;
-}
-
-void* GLKQuaternionMakeWithMatrix4(void)
-{
-    if (verbose) puts("STUB: GLKQuaternionMakeWithMatrix4 called");
-    return NULL;
-}
-
-void* GLKQuaternionRotateVector3Array(void)
-{
-    if (verbose) puts("STUB: GLKQuaternionRotateVector3Array called");
-    return NULL;
-}
-
-void* GLKQuaternionRotateVector4Array(void)
-{
-    if (verbose) puts("STUB: GLKQuaternionRotateVector4Array called");
-    return NULL;
-}
-
-void* GLKQuaternionSlerp(void)
-{
-    if (verbose) puts("STUB: GLKQuaternionSlerp called");
     return NULL;
 }
 

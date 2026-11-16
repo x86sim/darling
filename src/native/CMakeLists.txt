@@ -1,6 +1,15 @@
 project(native)
 
 include(wrap_elf)
+find_package(PkgConfig QUIET)
+
+# libdbus is used by CLI-side components too: LaunchServices and usernoted
+# (both in cli_gui_common) and iokitd talk to the host through this wrapper.
+if (COMPONENT_cli OR COMPONENT_dev_gui_common OR COMPONENT_iokitd)
+	set(CMAKE_INSTALL_DEFAULT_COMPONENT_NAME "cli_gui_common")
+
+	wrap_elf(dbus libdbus-1.so)
+endif()
 
 if (COMPONENT_gui)
 	set(CMAKE_INSTALL_DEFAULT_COMPONENT_NAME "gui")
@@ -17,8 +26,25 @@ if (COMPONENT_gui)
 	wrap_elf(XRandR libXrandr.so)
 	wrap_elf(Xcursor libXcursor.so)
 	wrap_elf(xkbfile libxkbfile.so)
+
+	# Wayland stack: wayland-client, wayland-cursor and xkbcommon form an indivisible
+	# unit used only by Cocotron's Wayland.backend. Only generate ELF wrappers if the
+	# full stack is present on the build host to prevent wrapgen dlopen() failures.
+	if (PKG_CONFIG_FOUND)
+		pkg_check_modules(WAYLAND_CLIENT QUIET wayland-client>=1.20)
+		pkg_check_modules(WAYLAND_CURSOR QUIET wayland-cursor)
+		pkg_check_modules(XKBCOMMON QUIET xkbcommon)
+	endif()
+
+	if (WAYLAND_CLIENT_FOUND AND WAYLAND_CURSOR_FOUND AND XKBCOMMON_FOUND)
+		wrap_elf(wayland-client libwayland-client.so)
+		wrap_elf(wayland-cursor libwayland-cursor.so)
+		wrap_elf(xkbcommon libxkbcommon.so)
+	else()
+		message(STATUS "native: skipping Wayland ELF wrappers (missing complete wayland-client>=1.20, wayland-cursor, xkbcommon stack)")
+	endif()
+
 	wrap_elf(cairo libcairo.so)
-	wrap_elf(dbus libdbus-1.so)
 	wrap_elf(GL libGL.so "System/Library/Frameworks/OpenGL.framework/Versions/A/Libraries")
 	wrap_elf(GLU libGLU.so "System/Library/Frameworks/OpenGL.framework/Versions/A/Libraries")
 endif()

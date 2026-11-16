@@ -1,7 +1,7 @@
 /*
  This file is part of Darling.
 
- Copyright (C) 2019 Lubos Dolezel
+ Copyright (C) 2026 Lubos Dolezel
 
  Darling is free software: you can redistribute it and/or modify
  it under the terms of the GNU General Public License as published by
@@ -17,18 +17,28 @@
  along with Darling.  If not, see <http://www.gnu.org/licenses/>.
 */
 
-#import <CloudKit/CKFetchSubscriptionsOperation.h>
+#import "CKInternal.h"
 
 @implementation CKFetchSubscriptionsOperation
 
-- (NSMethodSignature *)methodSignatureForSelector:(SEL)aSelector
+@synthesize subscriptionIDs = _subscriptionIDs;
+@synthesize fetchSubscriptionCompletionBlock = _fetchSubscriptionCompletionBlock;
+
+- (instancetype)initWithSubscriptionIDs:(NSArray<CKSubscriptionID> *)subscriptionIDs
 {
-    return [NSMethodSignature signatureWithObjCTypes: "v@:"];
+    if ((self = [super init]))
+        _subscriptionIDs = [subscriptionIDs copy];
+    return self;
 }
 
-- (void)forwardInvocation:(NSInvocation *)anInvocation
++ (instancetype)fetchAllSubscriptionsOperation
 {
-    NSLog(@"Stub called: %@ in %@", NSStringFromSelector([anInvocation selector]), [self class]);
+    return [[self alloc] init];
 }
 
+- (void)_performWithError:(NSError *)error
+{
+    if (_fetchSubscriptionCompletionBlock)
+        _fetchSubscriptionCompletionBlock(nil, error);
+}
 @end

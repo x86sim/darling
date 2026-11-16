@@ -52,6 +52,9 @@
 [submodule "src/external/darling-dmg"]
 	path = src/external/darling-dmg
 	url = https://github.com/x86sim/darling-dmg.git
+[submodule "src/external/bomutils"]
+	path = src/external/bomutils
+	url = https://github.com/x86sim/bomutils.git
 [submodule "src/external/installer"]
 	path = src/external/installer
 	url = https://github.com/x86sim/darling-installer.git
@@ -226,6 +229,9 @@
 [submodule "src/external/TextEdit"]
 	path = src/external/TextEdit
 	url = https://github.com/x86sim/darling-TextEdit.git
+[submodule "src/external/Console"]
+	path = src/external/Console
+	url = https://github.com/x86sim/darling-Console.git
 [submodule "src/external/bsm"]
 	path = src/external/bsm
 	url = https://github.com/x86sim/darling-bsm.git
@@ -454,3 +460,24 @@
 [submodule "src/external/xnu"]
 	path = src/external/xnu
 	url = git@github.com:x86sim/darling-xnu.git
+[submodule "src/external/libpcap"]
+	path = src/external/libpcap
+	url = https://github.com/x86sim/darling-libpcap.git
+[submodule "src/external/stanford-srp"]
+	path = src/external/stanford-srp
+	url = https://github.com/x86sim/stanford-srp.git
+[submodule "src/external/OpenCombine"]
+	path = src/external/OpenCombine
+	url = https://github.com/x86sim/OpenCombine.git
+[submodule "src/external/swift-foundation"]
+	path = src/external/swift-foundation
+	url = https://github.com/x86sim/swift-foundation.git
+	branch = release/6.3
+[submodule "src/external/swift-cmark"]
+	path = src/external/swift-cmark
+	url = https://github.com/x86sim/swift-cmark.git
+	branch = release/6.3
+[submodule "src/external/openal-soft"]
+	path = src/external/openal-soft
+	url = https://github.com/x86sim/openal-soft.git
+	branch = v1.20

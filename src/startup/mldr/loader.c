@@ -11,16 +11,202 @@
 
 #include "loader.h"
 
+// Keyed on GEN_64BIT, not __aarch64__. mldr.c includes this file twice, once per word
+// size, and __aarch64__ is true in both passes, so a definition guarded only by the
+// architecture is emitted twice and the second one is a redefinition error.
+#if defined(GEN_64BIT) && defined(__aarch64__)
+#define MLDR_ARM_THREAD_STATE64 6
+struct mldr_arm_thread_state64 {
+	uint64_t x[29];
+	uint64_t fp;
+	uint64_t lr;
+	uint64_t sp;
+	uint64_t pc;
+	uint32_t cpsr;
+};
+#define MLDR_ARM_THREAD_STATE64_COUNT (sizeof(struct mldr_arm_thread_state64) / sizeof(uint32_t))
+#endif
+
 static int native_prot(int prot);
 static void load(const char* path, cpu_type_t cpu, bool expect_dylinker, char** argv, struct load_results* lr);
 static void setup_space(struct load_results* lr, bool is_64_bit);
 static void* compatible_mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset);
 
-#ifndef PAGE_SIZE
-#	define PAGE_SIZE	4096
+#ifndef PAGE_ROUNDUP
+#	define PAGE_ROUNDUP(x) (((x) + (PAGE_SIZE - 1)) & ~(PAGE_SIZE - 1))
 #endif
-#define PAGE_ALIGN(x) (x & ~(PAGE_SIZE-1))
-#define PAGE_ROUNDUP(x) (((((x)-1) / PAGE_SIZE)+1) * PAGE_SIZE)
+
+#ifndef MLDR_PAGE_SIZE_HELPERS_DEFINED
+#define MLDR_PAGE_SIZE_HELPERS_DEFINED
+
+/*
+ * Dynamic page size helper for Mach-O loading.
+ *
+ * On Apple Silicon (and any aarch64 macOS target) the standard ABI uses 16 KB
+ * segment alignment. When running under a Linux kernel with 4 KB pages, using a
+ * plain 4 KB host page size would leave gaps between adjacent Mach-O segments
+ * unmapped (the file-backed mmap of segment N ends at filesize rounded to 4 KB,
+ * but segment N+1 starts at vmaddr rounded to 16 KB — leaving 12 KB unmapped,
+ * triggering an immediate SIGSEGV on any access).
+ *
+ * Conversely, on host kernels configured with 64 KB pages (e.g. some RHEL or
+ * Asahi Linux kernels), the host page size is larger than 16 KB.
+ *
+ * We dynamically query the host kernel page size at runtime via
+ * sysconf(_SC_PAGESIZE) and use max(host_page_size, abi_page_size) so that
+ * the alignment is never smaller than either the kernel requires or the Mach-O
+ * ABI expects.
+ */
+static inline size_t mldr_get_host_page_size(void) {
+	static size_t hps = 0;
+	size_t cached = __atomic_load_n(&hps, __ATOMIC_RELAXED);
+	if (__builtin_expect(!cached, 0)) {
+		long ps = sysconf(_SC_PAGESIZE);
+		cached = (ps > 0) ? (size_t)ps : (size_t)PAGE_SIZE;
+		__atomic_store_n(&hps, cached, __ATOMIC_RELAXED);
+	}
+	return cached;
+}
+
+static inline size_t mldr_get_macho_page_size(uint32_t cputype) {
+	size_t host_ps = mldr_get_host_page_size();
+#if defined(__aarch64__) || defined(__arm64__)
+	/* On aarch64, standard macOS Mach-O segment alignment is 16 KB.
+	 * If the host kernel has larger pages (e.g. 64 KB), host_ps takes precedence. */
+	size_t abi_ps = (cputype == CPU_TYPE_ARM64) ? 0x4000UL : host_ps;
+	return (host_ps > abi_ps) ? host_ps : abi_ps;
+#else
+	(void)cputype;
+	return host_ps;
+#endif
+}
+
+static inline size_t mldr_page_roundup(size_t val, size_t ps) {
+	return (val + ps - 1) & ~(ps - 1);
+}
+
+#endif /* MLDR_PAGE_SIZE_HELPERS_DEFINED */
+
+#ifndef MLDR_MMAP_MIN_ADDR_HINT_DEFINED
+#define MLDR_MMAP_MIN_ADDR_HINT_DEFINED
+
+/*
+ * A mapping at a fixed address fails with EPERM when the address is below the
+ * kernel's vm.mmap_min_addr. Executables that are not position independent,
+ * common among old i386 applications, are linked to load at 0x1000. Say what
+ * is wrong and how to allow it, instead of only reporting EPERM.
+ */
+static void mldr_explain_mmap_failure(int err, uintptr_t addr)
+{
+	unsigned long min_addr;
+	FILE* f;
+
+	if (err != EPERM)
+		return;
+
+	f = fopen("/proc/sys/vm/mmap_min_addr", "r");
+	if (f == NULL)
+		return;
+	if (fscanf(f, "%lu", &min_addr) != 1)
+		min_addr = 0;
+	fclose(f);
+
+	if (addr >= min_addr)
+		return;
+
+	fprintf(stderr,
+		"This executable is not position independent and must be loaded at %#lx,\n"
+		"below the lowest address Linux allows to be mapped (vm.mmap_min_addr = %lu).\n"
+		"To allow it, run: sudo sysctl -w vm.mmap_min_addr=%lu\n"
+		"See https://docs.darlinghq.org/common-issues.html#cannot-mmap-segment-__text-at-0x1000-operation-not-permitted\n",
+		(unsigned long) addr, min_addr, (unsigned long) addr);
+}
+
+#endif /* MLDR_MMAP_MIN_ADDR_HINT_DEFINED */
+
+#if defined(GEN_64BIT) && defined(__aarch64__) && !defined(MLDR_TSD_REWRITE_DEFINED)
+#define MLDR_TSD_REWRITE_DEFINED
+
+#include "tsd_rewrite.h"
+
+uintptr_t __darling_arm64_tsd_slot_offset(void);
+bool __darling_arm64_rseq_cpu_offset(intptr_t* offset);
+
+// Changes the Darwin TSD base reads in the instruction sections of one mapped
+// segment so that they read the native TLS slot, and the Darwin CPU number
+// reads so that they yield the CPU number (see tsd_rewrite.h). Only sections
+// the Mach-O marks as holding instructions are scanned, so data words that
+// happen to look like a pair are never touched. The pages are made writable
+// only while they are patched, and are never writable and executable together.
+static void mldr_rewrite_tsd_reads(struct segment_command_64* seg, uintptr_t seg_addr, int useprot, size_t host_ps)
+{
+	const uintptr_t slot_offset = __darling_arm64_tsd_slot_offset();
+	const bool rewrite_tsd = mldr_tsd_slot_offset_valid(slot_offset);
+	intptr_t rseq_offset = 0;
+	const bool rseq_known = __darling_arm64_rseq_cpu_offset(&rseq_offset);
+	const struct mldr_cpu_number_source cpu_source = mldr_cpu_number_source_for(rseq_known, rseq_offset);
+
+	// the section headers follow the segment command, inside its cmdsize
+	if (seg->cmdsize < sizeof(*seg) || (seg->cmdsize - sizeof(*seg)) / sizeof(struct section_64) < seg->nsects)
+		return;
+
+	struct section_64* sect = (struct section_64*) (seg + 1);
+	// the file-backed pages of the segment mapping
+	const uintptr_t mapped_end = seg_addr + mldr_page_roundup(seg->filesize, host_ps);
+
+	for (uint32_t i = 0; i < seg->nsects; i++, sect++)
+	{
+		if (!(sect->flags & (S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS)))
+			continue;
+		if (sect->addr < seg->vmaddr || sect->addr - seg->vmaddr >= seg->filesize)
+			continue;
+
+		uint64_t offset = sect->addr - seg->vmaddr;
+		uint64_t size = sect->size;
+		if (size > seg->filesize - offset)
+			size = seg->filesize - offset;
+		// instructions are 4-byte aligned in the file and in memory
+		if ((offset & 3) != 0)
+			continue;
+
+		uint32_t* insns = (uint32_t*) (seg_addr + offset);
+		size_t count = size / sizeof(uint32_t);
+		const size_t tsd_reads = rewrite_tsd ? mldr_tsd_count_reads(insns, count) : 0;
+		const size_t cpu_reads = mldr_cpu_count_reads(insns, count);
+		if (tsd_reads == 0 && cpu_reads == 0)
+			continue;
+
+		uintptr_t first_page = ((uintptr_t) insns) & ~(host_ps - 1);
+		uintptr_t end = mldr_page_roundup(((uintptr_t) insns) + count * sizeof(uint32_t), host_ps);
+		if (end > mapped_end)
+			end = mapped_end;
+
+		if (mprotect((void*) first_page, end - first_page, PROT_READ | PROT_WRITE) != 0)
+		{
+			fprintf(stderr, "mldr: cannot make %s,%s writable to rewrite thread register reads at %p: %s\n",
+				seg->segname, sect->sectname, (void*) first_page, strerror(errno));
+			exit(1);
+		}
+
+		if (tsd_reads != 0)
+			mldr_tsd_rewrite_reads(insns, count, slot_offset);
+		if (cpu_reads != 0)
+			mldr_cpu_rewrite_reads(insns, count, cpu_source);
+
+		// Make the new instructions visible to instruction fetch before the
+		// pages can execute again.
+		__builtin___clear_cache((char*) insns, (char*) (insns + count));
+
+		if (mprotect((void*) first_page, end - first_page, useprot) != 0)
+		{
+			fprintf(stderr, "mldr: cannot restore the protection of %s,%s at %p: %s\n",
+				seg->segname, sect->sectname, (void*) first_page, strerror(errno));
+			exit(1);
+		}
+	}
+}
+
+#endif /* GEN_64BIT && __aarch64__ */
 
 // Definitions:
 // FUNCTION_NAME (load32/load64)
@@ -42,7 +228,11 @@ static void* compatible_mmap(void *addr, size_t length, int prot, int flags, int
 #   define SEGMENT_COMMAND LC_SEGMENT
 #   define MACH_HEADER_STRUCT mach_header
 #   define SECTION_STRUCT section
-#	define MAP_EXTRA MAP_32BIT
+#	ifdef MAP_32BIT
+#		define MAP_EXTRA MAP_32BIT
+#	else
+#		define MAP_EXTRA 0
+#	endif
 #else
 #   error See above
 #endif
@@ -56,8 +246,9 @@ void FUNCTION_NAME(int fd, bool expect_dylinker, struct load_results* lr)
 	uintptr_t slide = 0;
 	uintptr_t mmapSize = 0;
 	bool pie = false;
-	uint32_t fat_offset;
+	off_t fat_offset;
 	void* tmp_map_base = NULL;
+	const int source_fd = fd;
 
 	if (!expect_dylinker)
 	{
@@ -73,6 +264,9 @@ void FUNCTION_NAME(int fd, bool expect_dylinker, struct load_results* lr)
 
 	fat_offset = lseek(fd, 0, SEEK_CUR);
 
+	if (!expect_dylinker)
+		fd = code_signing_gate(fd, fat_offset, lr);
+
 	if (read(fd, &header, sizeof(header)) != sizeof(header))
 	{
 		fprintf(stderr, "Cannot read the mach header.\n");
@@ -84,6 +278,10 @@ void FUNCTION_NAME(int fd, bool expect_dylinker, struct load_results* lr)
 		fprintf(stderr, "Found unexpected Mach-O file type: %u\n", header.filetype);
 		exit(1);
 	}
+
+	// before any segment is mapped, so that they get the executable-data mode
+	if (header.filetype == MH_EXECUTE)
+		mldr_apply_exec_policy(lr, header.cputype == CPU_TYPE_X86, header.flags);
 
 	tmp_map_base = mmap(NULL, PAGE_ROUNDUP(sizeof(header) + header.sizeofcmds), PROT_READ, MAP_PRIVATE, fd, fat_offset);
 	if (tmp_map_base == MAP_FAILED) {
@@ -103,7 +301,7 @@ void FUNCTION_NAME(int fd, bool expect_dylinker, struct load_results* lr)
 			struct SEGMENT_STRUCT* seg = (struct SEGMENT_STRUCT*) &cmds[p];
 
 			// Load commands are always sorted, so this will get us the maximum address.
-			if (seg->cmd == SEGMENT_COMMAND && strcmp(seg->segname, "__PAGEZERO") != 0)
+			if (seg->cmd == SEGMENT_COMMAND && strcmp(seg->segname, "__PAGEZERO") != 0 && seg->vmsize != 0)
 			{
 				if (base == -1)
 				{
@@ -111,18 +309,83 @@ void FUNCTION_NAME(int fd, bool expect_dylinker, struct load_results* lr)
 					//if (base != 0 && header.filetype == MH_DYLINKER)
 					//	goto no_slide;
 				}
-				mmapSize = seg->vmaddr + seg->vmsize - base;
+				// the anonymous part of the last segment extends to its Mach-O page
+				mmapSize = mldr_page_roundup(seg->vmaddr + seg->vmsize - base, mldr_get_macho_page_size(header.cputype));
 			}
 
 			p += seg->cmdsize;
 		}
 
-		slide = (uintptr_t) mmap((void*) base, mmapSize, PROT_NONE, MAP_ANONYMOUS | MAP_PRIVATE | MAP_EXTRA, -1, 0);
+		void* mmap_hint = (void*) base;
+#if (defined(__aarch64__) || defined(__arm64__)) && defined(GEN_64BIT)
+		/* Set when we allocate the slot ourselves rather than honouring a
+		 * preferred address the binary asked for. */
+		int managed_slot = 0;
+		/* macOS ObjC FAST_DATA_MASK is 0x00007ffffffffff8 — only 47 bits of
+		 * data pointer. On Linux ARM64 the kernel happily returns 48-bit VAs
+		 * (e.g. 0xfe..) which then get truncated by the mask to a bogus
+		 * address, crashing readClass() with SIGSEGV. Force the mapping into
+		 * a low-VA window we control. We hand out distinct slots so dyld and
+		 * subsequently-loaded dylibs don't collide with the main executable
+		 * (which typically wants 0x100000000). */
+		/* Leave the modern ARM64 shared cache's preferred range (6 GiB and
+         * above) available. dyld reserves its actual cache span before mapping
+         * files, so an incompatible future layout fails without overwriting us. */
+		static uintptr_t next_low_addr = 0x1000000000ULL; /* 64 GiB; below the ObjC 47-bit ceiling */
+		if (base == 0) {
+			mmap_hint = (void*)next_low_addr;
+			managed_slot = 1;
+		}
+#endif
+		/* When the slot is ours, reserve exactly where we asked. A bare hint lets
+		 * the kernel return a different address, which leaves the slot allocator
+		 * bookkeeping describing a range it no longer holds. */
+#if (defined(__aarch64__) || defined(__arm64__)) && defined(GEN_64BIT)
+		if (managed_slot) {
+			while (1) {
+				slide = (uintptr_t) mmap(mmap_hint, mmapSize, PROT_NONE,
+					MAP_ANONYMOUS | MAP_PRIVATE | MAP_EXTRA | MAP_FIXED_NOREPLACE, -1, 0);
+				if (slide != (uintptr_t)MAP_FAILED || errno != EEXIST)
+					break;
+				/* Slot occupied; advance to next 16 MiB boundary and retry */
+				uintptr_t bump = ((uintptr_t)mmap_hint + mmapSize + 0xffffff) & ~0xffffffULL;
+				if (bump >= 0x800000000000ULL)
+					break;
+				next_low_addr = bump;
+				mmap_hint = (void*)bump;
+			}
+		} else
+#endif
+		{
+			slide = (uintptr_t) mmap(mmap_hint, mmapSize, PROT_NONE,
+				MAP_ANONYMOUS | MAP_PRIVATE | MAP_EXTRA, -1, 0);
+		}
 		if (slide == (uintptr_t)MAP_FAILED)
 		{
 			fprintf(stderr, "Cannot mmap anonymous memory range: %s\n", strerror(errno));
 			exit(1);
 		}
+#if (defined(__aarch64__) || defined(__arm64__)) && defined(GEN_64BIT)
+		/* If we ended up above 2^47 anyway, retry with MAP_FIXED_NOREPLACE in the low
+		 * range so the slid address stays reachable through FAST_DATA_MASK. */
+		if (slide >= 0x800000000000ULL) {
+			munmap((void*)slide, mmapSize);
+			slide = (uintptr_t)mmap((void*)next_low_addr, mmapSize, PROT_NONE,
+			                         MAP_ANONYMOUS | MAP_PRIVATE | MAP_EXTRA | MAP_FIXED_NOREPLACE,
+			                         -1, 0);
+			if (slide == (uintptr_t)MAP_FAILED) {
+				fprintf(stderr, "Cannot mmap low-VA range: %s\n", strerror(errno));
+				exit(1);
+			}
+		}
+		/* Bump the slot for the next allocation, leaving headroom.
+		 * Derive it from the slot we requested, not from wherever the kernel
+		 * placed the mapping: had that landed below the current slot, comparing
+		 * against it made this whole update a no-op and handed the next load the
+		 * same range, with the reservation unmapped immediately below. */
+		if (base == 0)
+			next_low_addr = ((uintptr_t)mmap_hint + mmapSize + 0xffffff) & ~0xffffffULL;
+#endif
 
 		// unmap it so we can map the actual segments later using MAP_FIXED_NOREPLACE;
 		// we're the only thread running, so there's no chance this memory range will become occupied from now until then
@@ -156,84 +419,45 @@ no_slide:
 				int initprot = native_prot(seg->initprot);
 				int useprot = (initprot & PROT_EXEC) ? maxprot : initprot;
 
-				if (seg->filesize < seg->vmsize)
+				// Skip zero-vmsize segments (e.g. __DWARF), __PAGEZERO or any unmapped zero-address segment
+				if (seg->vmsize == 0 || strcmp(seg->segname, "__PAGEZERO") == 0 || (seg->vmaddr == 0 && useprot == 0))
 				{
-					unsigned long map_addr;
-					if (slide != 0)
-					{
-						unsigned long addr = seg->vmaddr;
-
-						if (addr != 0)
-							addr += slide;
-
-						// Some segments' filesize != vmsize, thus this mprotect().
-						rv = compatible_mmap((void*)addr, seg->vmsize, useprot, MAP_ANONYMOUS | MAP_PRIVATE | MAP_FIXED_NOREPLACE, -1, 0);
-						if (rv == (void*)MAP_FAILED)
-						{
-							if (seg->vmaddr == 0 && useprot == 0) {
-								// this is the PAGEZERO segment;
-								// if we can't map it, assume everything is fine and the system has already made that area inaccessible
-								rv = 0;
-							} else {
-								fprintf(stderr, "Cannot mmap segment %s at %p: %s\n", seg->segname, (void*)(uintptr_t)seg->vmaddr, strerror(errno));
-								exit(1);
-							}
-						}
-					}
-					else
-					{
-						// Zero-fill from the page holding the end of the file data up to the
-						// page holding the end of the segment. Rounding the start down and the
-						// size up separately left the last page unmapped whenever vmsize is not
-						// page-aligned (e.g. binaries linked by Zig).
-						uintptr_t zf_start = PAGE_ALIGN(seg->vmaddr + seg->filesize);
-						uintptr_t zf_end = PAGE_ROUNDUP(seg->vmaddr + seg->vmsize);
-						rv = compatible_mmap((void*) zf_start, zf_end - zf_start, useprot,
-								MAP_ANONYMOUS | MAP_PRIVATE | MAP_FIXED_NOREPLACE, -1, 0);
-						if (rv == (void*)MAP_FAILED)
-						{
-							if (seg->vmaddr == 0 && useprot == 0) {
-								// this is the PAGEZERO segment;
-								// if we can't map it, assume everything is fine and the system has already made that area inaccessible
-								rv = 0;
-							} else {
-								fprintf(stderr, "Cannot mmap segment %s at %p: %s\n", seg->segname, (void*)(uintptr_t)seg->vmaddr, strerror(errno));
-								exit(1);
-							}
-						}
-					}
+					if (seg->vmaddr + slide + seg->vmsize > lr->vm_addr_max)
+						lr->vm_addr_max = seg->vmaddr + slide + seg->vmsize;
+					break;
 				}
 
+				/* Zero-based dylinker __TEXT also needs its slide; PAGEZERO was skipped above. */
+				uintptr_t seg_addr = seg->vmaddr + slide;
+
+				const size_t host_ps = mldr_get_host_page_size();
+				const size_t page_sz = mldr_get_macho_page_size(header.cputype);
+
+				// 1. Map the file-backed portion of the segment
 				if (seg->filesize > 0)
 				{
-					unsigned long addr = seg->vmaddr + slide;
-					int flag = MAP_FIXED_NOREPLACE;
-					if (seg->filesize < seg->vmsize) {
-						flag = MAP_FIXED;
-					}
-					rv = compatible_mmap((void*)addr, seg->filesize, useprot,
-							flag | MAP_PRIVATE, fd, seg->fileoff + fat_offset);
+					rv = compatible_mmap((void*)seg_addr, seg->filesize, useprot,
+							MAP_FIXED_NOREPLACE | MAP_PRIVATE, fd, seg->fileoff + fat_offset);
 					if (rv == (void*)MAP_FAILED)
 					{
-						if (seg->vmaddr == 0 && useprot == 0) {
-							// this is the PAGEZERO segment;
-							// if we can't map it, assume everything is fine and the system has already made that area inaccessible
-							rv = 0;
-						} else {
-							fprintf(stderr, "Cannot mmap segment %s at %p: %s\n", seg->segname, (void*)(uintptr_t)seg->vmaddr, strerror(errno));
-							exit(1);
-						}
+						int err = errno;
+						fprintf(stderr, "Cannot mmap segment %s at %p: %s\n", seg->segname, (void*)seg_addr, strerror(err));
+						mldr_explain_mmap_failure(err, seg_addr);
+						exit(1);
 					}
+
+					if (seg->fileoff == 0)
+						mappedHeader = (struct MACH_HEADER_STRUCT*) seg_addr;
 
 					// The file mapping covers its whole last page: past filesize that page
 					// holds whatever follows in the file, where the segment must read as
 					// zeros (start of __bss/__thread_bss), as the XNU loader guarantees.
 					if (seg->filesize < seg->vmsize)
 					{
-						uintptr_t tail = addr + seg->filesize;
+						uintptr_t tail = seg_addr + seg->filesize;
 						uintptr_t tail_end = PAGE_ROUNDUP(tail);
-						if (tail_end > addr + seg->vmsize)
-							tail_end = addr + seg->vmsize;
+						if (tail_end > seg_addr + seg->vmsize)
+							tail_end = seg_addr + seg->vmsize;
 						if (tail_end > tail)
 						{
 							if (!(useprot & PROT_WRITE))
@@ -244,8 +468,39 @@ no_slide:
 						}
 					}
 
-					if (seg->fileoff == 0)
-						mappedHeader = (struct MACH_HEADER_STRUCT*) (seg->vmaddr + slide);
+#if defined(GEN_64BIT) && defined(__aarch64__)
+					// Before the segment is sealed: sealing makes it unchangeable.
+					if (useprot & PROT_EXEC)
+						mldr_rewrite_tsd_reads(seg, seg_addr, useprot, host_ps);
+#endif
+
+					if (lr->seal_images && (useprot & PROT_READ) && !(useprot & PROT_WRITE) &&
+						(strncmp(seg->segname, SEG_TEXT, sizeof(seg->segname)) == 0 ||
+						 strncmp(seg->segname, SEG_LINKEDIT, sizeof(seg->segname)) == 0))
+					{
+						seal_segment(seg->segname, seg_addr, seg->filesize, useprot);
+					}
+				}
+
+				// 2. Map the remaining BSS/anonymous pages (if any) beyond the file-backed pages.
+				// Round the total segment size up to the Mach-O target page size (page_sz)
+				// so that the gap between adjacent segments is completely covered by BSS mappings.
+				size_t file_pages = seg->filesize > 0 ? mldr_page_roundup(seg->filesize, host_ps) : 0;
+				size_t total_segment_size = mldr_page_roundup(seg->vmsize, page_sz);
+				if (total_segment_size > file_pages)
+				{
+					uintptr_t bss_addr = seg_addr + file_pages;
+					size_t bss_size = total_segment_size - file_pages;
+
+					rv = compatible_mmap((void*)bss_addr, bss_size, useprot,
+							MAP_ANONYMOUS | MAP_PRIVATE | MAP_FIXED_NOREPLACE, -1, 0);
+					if (rv == (void*)MAP_FAILED)
+					{
+						int err = errno;
+						fprintf(stderr, "Cannot mmap bss for segment %s at %p: %s\n", seg->segname, (void*)bss_addr, strerror(err));
+						mldr_explain_mmap_failure(err, bss_addr);
+						exit(1);
+					}
 				}
 
 				if (seg->vmaddr + slide + seg->vmsize > lr->vm_addr_max)
@@ -273,7 +528,26 @@ no_slide:
 			case LC_UNIXTHREAD:
 			{
 #ifdef GEN_64BIT
+#if defined(__x86_64__)
 				entryPoint = ((uint64_t*) lc)[18];
+#elif defined(__aarch64__)
+				if (lc->cmdsize < sizeof(*lc) + 2 * sizeof(uint32_t) + sizeof(struct mldr_arm_thread_state64)) {
+					fprintf(stderr, "Truncated ARM64 LC_UNIXTHREAD command\n");
+					exit(1);
+				}
+				uint32_t* thread_command_data = (uint32_t*)(lc + 1);
+				if (thread_command_data[0] != MLDR_ARM_THREAD_STATE64 ||
+						thread_command_data[1] < MLDR_ARM_THREAD_STATE64_COUNT ||
+						thread_command_data[1] > (lc->cmdsize - sizeof(*lc) - 2 * sizeof(uint32_t)) / sizeof(uint32_t)) {
+					fprintf(stderr, "Invalid ARM64 LC_UNIXTHREAD state\n");
+					exit(1);
+				}
+				struct mldr_arm_thread_state64 state;
+				memcpy(&state, &thread_command_data[2], sizeof(state));
+				entryPoint = state.pc;
+#else
+#error Unsupported 64-bit architecture
+#endif
 #endif
 #ifdef GEN_32BIT
 				entryPoint = ((uint32_t*) lc)[14];
@@ -291,7 +565,7 @@ no_slide:
 				}
 
 				struct dylinker_command* dy = (struct dylinker_command*) lc;
-				char* path;
+				char* path = NULL;
 				size_t length;
 				static char path_buffer[4096];
 
@@ -364,6 +638,10 @@ no_slide:
 
 	if (tmp_map_base)
 		munmap(tmp_map_base, PAGE_ROUNDUP(sizeof(header) + header.sizeofcmds));
+
+	// the image was mapped from a snapshot (code_signing_gate()); the mappings keep it alive
+	if (fd != source_fd)
+		close(fd);
 }
 
 
@@ -373,4 +651,3 @@ no_slide:
 #undef MACH_HEADER_STRUCT
 #undef SECTION_STRUCT
 #undef MAP_EXTRA
-

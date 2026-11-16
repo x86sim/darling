@@ -1,4 +1,5 @@
 #include "DASession.h"
+#include <DiskArbitration/DiskArbitration.h>
 #include <stddef.h>
 #include <string.h>
 #include <CoreFoundation/CFRuntime.h>
@@ -11,6 +12,9 @@ struct _DASession
 };
 
 static CFTypeID _kDASessionTypeID = 0;
+
+// DADisk.c
+extern void _DADiskInitializeMatchObjects(void);
 static void DASessionFinalize(CFTypeRef cf);
 static Boolean DASessionEqual(CFTypeRef cf1, CFTypeRef cf2);
 static CFHashCode DASessionHash(CFTypeRef cf);
@@ -68,6 +72,8 @@ CFTypeID DASessionGetTypeID(void)
 DASessionRef DASessionCreate(CFAllocatorRef allocator)
 {
 	DASessionRef new;
+
+	_DADiskInitializeMatchObjects();
 	
 	new = (DASessionRef) _CFRuntimeCreateInstance (allocator, _kDASessionTypeID,
 												DASESSION_SIZE, 0);
@@ -156,6 +162,8 @@ CFTypeID DAApprovalSessionGetTypeID(void)
 DAApprovalSessionRef DAApprovalSessionCreate(CFAllocatorRef allocator)
 {
 	DAApprovalSessionRef new;
+
+	_DADiskInitializeMatchObjects();
 	
 	new = (DAApprovalSessionRef) _CFRuntimeCreateInstance (allocator,
 												_kDAApprovalSessionTypeID,
@@ -174,4 +182,41 @@ void DAApprovalSessionUnscheduleFromRunLoop(DAApprovalSessionRef session,
 		CFRunLoopRef runLoop, CFStringRef runLoopMode)
 {
 	
+}
+
+/* Callback registration is accepted and ignored: no disk events are delivered. */
+void DARegisterDiskAppearedCallback(DASessionRef session, CFDictionaryRef match, DADiskAppearedCallback callback, void *context)
+{
+}
+
+void DARegisterDiskDescriptionChangedCallback(DASessionRef session, CFDictionaryRef match, CFArrayRef watch, DADiskDescriptionChangedCallback callback, void *context)
+{
+}
+
+void DARegisterDiskDisappearedCallback(DASessionRef session, CFDictionaryRef match, DADiskDisappearedCallback callback, void *context)
+{
+}
+
+void DARegisterDiskMountApprovalCallback(DASessionRef session, CFDictionaryRef match, DADiskMountApprovalCallback callback, void *context)
+{
+}
+
+void DARegisterDiskUnmountApprovalCallback(DASessionRef session, CFDictionaryRef match, DADiskUnmountApprovalCallback callback, void *context)
+{
+}
+
+void DARegisterDiskEjectApprovalCallback(DASessionRef session, CFDictionaryRef match, DADiskEjectApprovalCallback callback, void *context)
+{
+}
+
+void DARegisterDiskPeekCallback(DASessionRef session, CFDictionaryRef match, CFIndex order, DADiskPeekCallback callback, void *context)
+{
+}
+
+void DAUnregisterCallback(DASessionRef session, void *callback, void *context)
+{
+}
+
+void DAUnregisterApprovalCallback(DASessionRef session, void *callback, void *context)
+{
 }

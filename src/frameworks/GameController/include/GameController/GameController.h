@@ -26,6 +26,7 @@
 #import <GameController/CBCentralManagerDelegate.h>
 #import <GameController/CBPeripheralDelegate.h>
 #import <GameController/DigitizerValueChangedDelegate.h>
+#import <GameController/GCDeviceHaptics.h>
 #import <GameController/GCNamedProfile.h>
 #import <GameController/GameControllerClientProtocol.h>
 #import <GameController/GameControllerDaemon.h>
@@ -52,6 +53,7 @@
 #import <GameController/GCControllerMBDelegate.h>
 #import <GameController/GCControllerCBDelegate.h>
 #import <GameController/GCController.h>
+#import <GameController/GCPhysicalInputProfile.h>
 #import <GameController/GCEventViewController.h>
 #import <GameController/_GCController.h>
 #import <GameController/GCGamepadSnapshot.h>

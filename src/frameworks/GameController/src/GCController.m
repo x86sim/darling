@@ -18,17 +18,63 @@
 */
 
 #import <GameController/GCController.h>
+#import <GameController/GCMicroGamepad.h>
+#import <GameController/GCPhysicalInputProfile.h>
+#import <darling-stub-forwarding.h>
 
 @implementation GCController
 
++ (NSArray *)controllers {
+	return @[];
+}
+
+- (GCExtendedGamepad *)extendedGamepad {
+	return nil;
+}
+
+- (GCMicroGamepad *)microGamepad {
+	return nil;
+}
+
+- (GCPhysicalInputProfile *)physicalInputProfile {
+	return nil;
+}
+
+- (NSString *)vendorName {
+	return nil;
+}
+
+- (NSString *)productCategory {
+	return @"";
+}
+
+- (GCControllerPlayerIndex)playerIndex {
+	return GCControllerPlayerIndexUnset;
+}
+
+- (void)setPlayerIndex:(GCControllerPlayerIndex)playerIndex {
+}
+
 - (NSMethodSignature *)methodSignatureForSelector:(SEL)aSelector
 {
-    return [NSMethodSignature signatureWithObjCTypes: "v@:"];
+    return [super methodSignatureForSelector: aSelector] ?: DarlingStubMethodSignature(aSelector);
 }
 
 - (void)forwardInvocation:(NSInvocation *)anInvocation
 {
-    NSLog(@"Stub called: %@ in %@", NSStringFromSelector([anInvocation selector]), [self class]);
+    DarlingStubForwardInvocation(self, anInvocation);
+}
+
++ (NSMethodSignature *)methodSignatureForSelector:(SEL)aSelector
+{
+    return [super methodSignatureForSelector:aSelector] ?: DarlingStubMethodSignature(aSelector);
+}
+
++ (void)forwardInvocation:(NSInvocation *)anInvocation
+{
+    // Class methods that are not implemented are accepted, ignored and answer zero.
+    void *result = NULL;
+    [anInvocation setReturnValue:&result];
 }
 
 @end

@@ -2,6 +2,7 @@
  This file is part of Darling.
 
  Copyright (C) 2021 Lubos Dolezel
+ Copyright (C) 2026 Darling developers
 
  Darling is free software: you can redistribute it and/or modify
  it under the terms of the GNU General Public License as published by
@@ -21,14 +22,32 @@
 
 @implementation UNNotificationTrigger
 
-- (NSMethodSignature *)methodSignatureForSelector:(SEL)aSelector
+@synthesize repeats = _repeats;
+
++ (BOOL)supportsSecureCoding
 {
-    return [NSMethodSignature signatureWithObjCTypes: "v@:"];
+    return YES;
 }
 
-- (void)forwardInvocation:(NSInvocation *)anInvocation
+- (id)copyWithZone:(NSZone *)zone
 {
-    NSLog(@"Stub called: %@ in %@", NSStringFromSelector([anInvocation selector]), [self class]);
+    UNNotificationTrigger *copy = [[[self class] allocWithZone:zone] init];
+    copy->_repeats = self.repeats;
+    return copy;
+}
+
+- (void)encodeWithCoder:(NSCoder *)coder
+{
+    [coder encodeBool:_repeats forKey:@"repeats"];
+}
+
+- (instancetype)initWithCoder:(NSCoder *)coder
+{
+    self = [super init];
+    if (self) {
+        _repeats = [coder decodeBoolForKey:@"repeats"];
+    }
+    return self;
 }
 
 @end

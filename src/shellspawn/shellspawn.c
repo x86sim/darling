@@ -33,8 +33,12 @@ along with Darling.  If not, see <http://www.gnu.org/licenses/>.
 #include <sys/event.h>
 #include <sys/ioctl.h>
 #include <signal.h>
+#include <pwd.h>
+#include <limits.h>
 #include "shellspawn.h"
 #include "shellspawn-fds.h"
+#include "shellspawn-shell.h"
+#include "shellspawn-config.h"
 #include "duct_signals.h"
 
 #define DBG 0
@@ -56,11 +60,16 @@ int main(int argc, const char** argv)
 	// default disposition back before exec.
 	signal(SIGPIPE, SIG_IGN);
 
-	// shellspawn (daemon) --fork()--> shellspawn (child) --fork()--> exec /bin/bash
+	// shellspawn (daemon) --fork()--> shellspawn (child) --fork()--> exec the shell
 	// in order to read the exit status of the shell process,
 	// we have to allow it to become a zombie, therefore we need to
 	// restore the sigaction of SIGCHLD of the child shellspawn
 	setupSigchild();
+
+	// The darling launcher waits for the socket before it sends the first
+	// command, so binding it only after the system configuration has arrived
+	// makes every program started through shellspawn see the configuration.
+	waitForSystemConfig();
 	setupSocket();
 	int status = listenForConnections();
 
@@ -202,9 +211,11 @@ void spawnShell(int fd)
 
 	bool read_cmds = true;
 
-	argv = (char**) malloc(sizeof(char*) * 3);
-	argv[0] = "/bin/bash";
-	argv[1] = "--login";
+	// argv[0] is replaced by the login shell's name once the client has
+	// chosen the user (see below); a client's SETEXEC discards it.
+	argv = (char**) malloc(sizeof(char*) * 2);
+	argv[0] = "-zsh";
+	argc = 1;
 
 	char* alloc_exec = NULL;
 
@@ -261,8 +272,17 @@ void spawnShell(int fd)
 			{
 				if (param != NULL)
 				{
-					if (DBG) printf("set env: %s\n", param);
-					putenv(param);
+					// NAME=value with a non-empty name
+					char* equals = strchr(param, '=');
+					if (equals != NULL && equals != param)
+					{
+						if (DBG) printf("set env: %s\n", param);
+						putenv(param);
+					}
+					else
+					{
+						free(param);
+					}
 				}
 				break;
 			}
@@ -330,6 +350,18 @@ void spawnShell(int fd)
 		}
 	}
 
+	// Without a program of the client's choosing, run the login shell from the
+	// account entry of the user we run as.
+	char login_argv0[PATH_MAX];
+	const char* login_shell = SHELLSPAWN_DEFAULT_SHELL;
+	if (alloc_exec == NULL)
+	{
+		struct passwd* pw = getpwuid(getuid());
+		login_shell = shellspawn_choose_shell(pw != NULL ? pw->pw_shell : NULL);
+		if (argc > 0 && shellspawn_login_argv0(login_shell, login_argv0, sizeof(login_argv0)) == 0)
+			argv[0] = login_argv0;
+	}
+
 	// Add terminating NULL
 	argv = (char**) realloc(argv, sizeof(char*) * (argc + 1));
 	argv[argc] = NULL;
@@ -366,9 +398,7 @@ void spawnShell(int fd)
 
 			signal(SIGPIPE, SIG_DFL);
 
-			// In future, we may support spawning something else than Bash
-			// and check the provided shell against /etc/shells
-			execv(alloc_exec ? alloc_exec : "/bin/bash", argv);
+			execv(alloc_exec ? alloc_exec : login_shell, argv);
 		}
 
 		rv = errno;

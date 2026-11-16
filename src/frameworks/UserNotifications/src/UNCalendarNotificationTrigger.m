@@ -2,6 +2,7 @@
  This file is part of Darling.
 
  Copyright (C) 2021 Lubos Dolezel
+ Copyright (C) 2026 Darling developers
 
  Darling is free software: you can redistribute it and/or modify
  it under the terms of the GNU General Public License as published by
@@ -21,14 +22,58 @@
 
 @implementation UNCalendarNotificationTrigger
 
-- (NSMethodSignature *)methodSignatureForSelector:(SEL)aSelector
+@synthesize dateComponents = _dateComponents;
+
++ (BOOL)supportsSecureCoding
 {
-    return [NSMethodSignature signatureWithObjCTypes: "v@:"];
+    return YES;
 }
 
-- (void)forwardInvocation:(NSInvocation *)anInvocation
++ (instancetype)triggerWithDateMatchingComponents:(NSDateComponents *)dateComponents repeats:(BOOL)repeats
 {
-    NSLog(@"Stub called: %@ in %@", NSStringFromSelector([anInvocation selector]), [self class]);
+    UNCalendarNotificationTrigger *trigger = [[[self alloc] init] autorelease];
+    trigger->_dateComponents = [dateComponents copy];
+    trigger->_repeats = repeats;
+    return trigger;
+}
+
+- (void)dealloc
+{
+    [_dateComponents release];
+    [super dealloc];
+}
+
+- (NSDate *)nextTriggerDate
+{
+    NSCalendar *calendar = [NSCalendar currentCalendar];
+    return [calendar dateFromComponents:_dateComponents];
+}
+
+- (id)copyWithZone:(NSZone *)zone
+{
+    UNCalendarNotificationTrigger *copy = [super copyWithZone:zone];
+    copy->_dateComponents = [self.dateComponents copyWithZone:zone];
+    return copy;
+}
+
+- (void)encodeWithCoder:(NSCoder *)coder
+{
+    [super encodeWithCoder:coder];
+    [coder encodeObject:_dateComponents forKey:@"dateComponents"];
+}
+
+- (instancetype)initWithCoder:(NSCoder *)coder
+{
+    self = [super initWithCoder:coder];
+    if (self) {
+        if ([coder respondsToSelector:@selector(decodeObjectOfClass:forKey:)]) {
+            _dateComponents = [[coder decodeObjectOfClass:[NSDateComponents class] forKey:@"dateComponents"] copy];
+        }
+        if (!_dateComponents) {
+            _dateComponents = [[coder decodeObjectForKey:@"dateComponents"] copy];
+        }
+    }
+    return self;
 }
 
 @end

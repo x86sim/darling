@@ -1,7 +1,43 @@
 cmake_minimum_required(VERSION 3.13)
 
 SET(CMAKE_SYSTEM_NAME Linux)
-SET(CMAKE_SYSTEM_PROCESSOR "x86-64")
+
+# Detect host architecture before project() since CMAKE_HOST_SYSTEM_PROCESSOR
+# may not be available yet
+execute_process(COMMAND uname -m OUTPUT_VARIABLE _HOST_ARCH OUTPUT_STRIP_TRAILING_WHITESPACE)
+
+# The target defaults to the host. A toolchain file or -DCMAKE_SYSTEM_PROCESSOR
+# may choose another one, which makes this a cross build.
+if (NOT DEFINED CMAKE_SYSTEM_PROCESSOR)
+	if (_HOST_ARCH MATCHES "aarch64|arm64")
+		SET(CMAKE_SYSTEM_PROCESSOR "aarch64")
+	else()
+		SET(CMAKE_SYSTEM_PROCESSOR "x86-64")
+	endif()
+endif()
+
+if (CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+	set(_TARGET_ARCH_ARM64 TRUE)
+else()
+	set(_TARGET_ARCH_ARM64 FALSE)
+endif()
+if (_HOST_ARCH MATCHES "aarch64|arm64")
+	set(_HOST_ARCH_ARM64 TRUE)
+else()
+	set(_HOST_ARCH_ARM64 FALSE)
+endif()
+
+# CMAKE_CROSSCOMPILING is always true here (CMAKE_SYSTEM_NAME is set above and
+# forced again after project()), so it cannot tell a cross build apart.
+# DARLING_CROSS_BUILD is set when the Linux side of Darling (mldr,
+# darlingserver, the launcher) is built for another architecture than the
+# build machine's, so tools that run during the build must be built separately.
+if (NOT _TARGET_ARCH_ARM64 STREQUAL _HOST_ARCH_ARM64)
+	set(_DARLING_CROSS_DEFAULT ON)
+else()
+	set(_DARLING_CROSS_DEFAULT OFF)
+endif()
+option(DARLING_CROSS_BUILD "Build the build-time tools for the build machine separately" ${_DARLING_CROSS_DEFAULT})
 
 # This allows setting the compiler with -DCMAKE_C_COMPILER when configuring.
 if (NOT DEFINED CMAKE_C_COMPILER)
@@ -67,6 +103,11 @@ set(CMAKE_OSX_DEPLOYMENT_TARGET 11.0 CACHE STRING "The version of macOS we're si
 
 project(darling)
 
+# Most of Darling is built for Darwin. Without this, a toolchain file that sets it to FALSE (as
+# distributions' build tools do) makes custom commands such as `true` resolve to the Darwin
+# executable targets of the same name, which cannot run on the host.
+set(CMAKE_CROSSCOMPILING TRUE)
+
 enable_language(ASM)
 
 # CMake's default ASM rule appends to an existing archive (unlike C/C++), which fails once ranlib has made it fat.
@@ -83,6 +124,7 @@ set(CMAKE_INSTALL_DEFAULT_COMPONENT_NAME "core")
 set(CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake")
 include(clang_version_check)
 include(InstallSymlink)
+include(darling_android)
 include(MacroEnsureOutOfSourceBuild)
 include(dsym)
 include(xcproj)
@@ -102,7 +144,7 @@ set(CMAKE_C_IMPLICIT_LINK_LIBRARIES "")
 set(CMAKE_CXX_IMPLICIT_LINK_LIBRARIES "")
 
 if (${CMAKE_HOST_SYSTEM_PROCESSOR} MATCHES "i686|i386")
-	message(FATAL_ERROR "This software can only be built on x86-64 systems")
+	message(FATAL_ERROR "This software can only be built on x86-64 or aarch64 systems")
 endif (${CMAKE_HOST_SYSTEM_PROCESSOR} MATCHES "i686|i386")
 
 SET(IGNORED_WARNINGS "-Wno-nullability-completeness -Wno-deprecated-declarations -Wno-availability")
@@ -145,6 +187,23 @@ set(CMAKE_ASM_FLAGS "${CMAKE_ASM_FLAGS} ${ASM_IGNORED_WARNINGS}")
 SET(CMAKE_C_FLAGS_DEBUG "-O0 -ggdb")
 SET(CMAKE_CXX_FLAGS_DEBUG "-O0 -ggdb")
 
+# Without a build type, CMake adds no optimisation or debug info flags at all.
+# Build optimised with debug info unless a build type is chosen explicitly.
+if (NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+	set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING
+		"Choose the type of build: Debug, Release, RelWithDebInfo or MinSizeRel." FORCE)
+endif()
+
+# Darling has always been built with assertions enabled, and the pre-generated
+# JavaScriptCore LLInt headers (LLIntOffsets/*/debug) only match a build where
+# ASSERT_ENABLED is set. Keep the optimisation and debug info flags, but drop
+# the -DNDEBUG that CMake adds to the non-debug build types.
+foreach (lang C CXX ASM)
+	foreach (config RELEASE RELWITHDEBINFO MINSIZEREL)
+		string(REPLACE "-DNDEBUG" "" CMAKE_${lang}_FLAGS_${config} "${CMAKE_${lang}_FLAGS_${config}}")
+	endforeach()
+endforeach()
+
 # prevent object filename conflicts for two source files that differ only in extension (e.g. `object.c` and `object.m`)
 set(CMAKE_C_OUTPUT_EXTENSION ".c.o")
 set(CMAKE_CXX_OUTPUT_EXTENSION ".cpp.o")
@@ -158,11 +217,37 @@ endif(CMAKE_POSITION_INDEPENDENT_CODE)
 
 enable_language(ASM-ATT)
 
-option(TARGET_i386 "Enable i386 slices" ON)
-option(TARGET_x86_64 "Enable x86_64 slices" ON)
+if (_TARGET_ARCH_ARM64)
+	option(TARGET_i386 "Enable i386 slices" OFF)
+	option(TARGET_x86_64 "Enable x86_64 slices" OFF)
+	option(TARGET_ARM64 "Enable arm64 slices" ON)
+else()
+	option(TARGET_i386 "Enable i386 slices" ON)
+	option(TARGET_x86_64 "Enable x86_64 slices" ON)
+	option(TARGET_ARM64 "Enable arm64 slices" OFF)
+endif()
 option(DEBIAN_PACKAGING "Packaging for Debian" OFF)
 option(ENABLE_TESTS "Install in-prefix unit tests" OFF)
 option(REGENERATE_SDK "Regenerate Header Files For Open Source SDK" OFF)
+option(ADHOC_CODESIGN "Ad-hoc sign every Mach-O image Darling builds" ON)
+
+# Host-side unit tests, run with ctest from the build directory
+enable_testing()
+
+# Tests of the install and packaging scripts; they need no Darling build
+find_package(Python3 QUIET COMPONENTS Interpreter)
+if (Python3_Interpreter_FOUND)
+	add_test(NAME install_symlink
+		COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/install-symlink.py)
+	add_test(NAME android_layout
+		COMMAND ${CMAKE_COMMAND} -P ${CMAKE_SOURCE_DIR}/tests/android-layout.cmake)
+	add_test(NAME debian_packaging
+		COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/debian-packaging.py)
+	# debian-packaging.py exits with 77 when debhelper is not installed
+	set_tests_properties(debian_packaging PROPERTIES SKIP_RETURN_CODE 77)
+	add_test(NAME target_conditionals
+		COMMAND sh ${CMAKE_SOURCE_DIR}/tests/headers/target-conditionals.sh ${CMAKE_SOURCE_DIR})
+endif()
 
 # Host-side unit tests, run with ctest from the build directory
 
@@ -224,6 +309,13 @@ cmake_policy(SET CMP0014 NEW)
 
 generate_architecture()
 
+# Optional: builds the Swift SDK overlays in src/external/swift when a Swift toolchain is available
+include(swift_toolchain)
+include(darling_swift)
+
+# Whether this is an Android build; the subdirectories use the result
+darling_host_is_android(DARLING_ANDROID_HOST)
+
 add_subdirectory(src)
 
 verify_sdk_header_include()
@@ -235,10 +327,16 @@ install(DIRECTORY DESTINATION libexec/darling/private/tmp)
 InstallSymlink(private/etc ${CMAKE_INSTALL_PREFIX}/libexec/darling/etc)
 InstallSymlink(private/var ${CMAKE_INSTALL_PREFIX}/libexec/darling/var)
 
-install(FILES etc/resolv.conf
-	DESTINATION libexec/darling/private/etc)
+# Follow the host's resolver configuration, so that local DNS stubs and
+# network changes apply in the guest. A copy edited inside a prefix stays
+# in the prefix's own layer and takes precedence over this link.
+InstallSymlink(/Volumes/SystemRoot/etc/resolv.conf ${CMAKE_INSTALL_PREFIX}/libexec/darling/private/etc/resolv.conf)
 InstallSymlink(/Volumes/SystemRoot/etc/machine-id ${CMAKE_INSTALL_PREFIX}/libexec/darling/private/etc/machine-id)
 InstallSymlink(/Volumes/SystemRoot/etc/nsswitch.conf ${CMAKE_INSTALL_PREFIX}/libexec/darling/private/etc/nsswitch.conf)
+
+# The data volume of a macOS system holds the user's files. Here it is the same
+# tree as the root, so paths under /System/Volumes/Data resolve as expected.
+InstallSymlink(../.. ${CMAKE_INSTALL_PREFIX}/libexec/darling/System/Volumes/Data)
 
 install(DIRECTORY DESTINATION libexec/darling/Volumes)
 install(DIRECTORY DESTINATION libexec/darling/Volumes/SystemRoot)
@@ -257,19 +355,42 @@ install(DIRECTORY DESTINATION libexec/darling/usr/local/share)
 InstallSymlink(/Volumes/SystemRoot/dev ${CMAKE_INSTALL_PREFIX}/libexec/darling/dev)
 InstallSymlink(private/tmp ${CMAKE_INSTALL_PREFIX}/libexec/darling/tmp)
 
+# An Android host has no /tmp and an application's temporary directory differs per application (its
+# cache directory; $PREFIX/tmp under Termux). The guest's /private/tmp therefore stays a directory in the
+# image, and the launcher links it to the host's temporary directory when it starts (see
+# src/startup/launcher-tmp.c): TMPDIR as the launcher was started with it, or DARLING_ANDROID_TMPDIR.
+set(DARLING_ANDROID_TMPDIR "" CACHE PATH "Android builds: host directory to use as the guest's /private/tmp when TMPDIR is not usable")
+if (DARLING_ANDROID_HOST)
+	# Host paths of the installation (/data/... on Android) resolve in the guest through a link named
+	# like the host's first path component.
+	darling_host_root_segment("${CMAKE_INSTALL_PREFIX}" DARLING_ANDROID_HOST_ROOT_SEGMENT)
+	if (NOT DARLING_ANDROID_HOST_ROOT_SEGMENT STREQUAL "")
+		InstallSymlink(/Volumes/SystemRoot/${DARLING_ANDROID_HOST_ROOT_SEGMENT} ${CMAKE_INSTALL_PREFIX}/libexec/darling/${DARLING_ANDROID_HOST_ROOT_SEGMENT})
+	endif()
+endif()
+
 InstallSymlink(/proc/self/mounts ${CMAKE_INSTALL_PREFIX}/libexec/darling/private/etc/mtab)
 #InstallSymlink(/Volumes/SystemRoot/etc/passwd ${CMAKE_INSTALL_PREFIX}/libexec/darling/private/etc/passwd)
 #InstallSymlink(/Volumes/SystemRoot/etc/group ${CMAKE_INSTALL_PREFIX}/libexec/darling/private/etc/group)
 InstallSymlink(/Volumes/SystemRoot/etc/localtime ${CMAKE_INSTALL_PREFIX}/libexec/darling/private/etc/localtime)
 
 InstallSymlink(/Volumes/SystemRoot/usr/share/zoneinfo ${CMAKE_INSTALL_PREFIX}/libexec/darling/usr/share/zoneinfo)
+# macOS 10.13 and later keep the zone files in /var/db/timezone/zoneinfo, which
+# libc and applications that read zone files themselves open. Point it at the
+# zone directory above, so every reader finds the same data.
+InstallSymlink(/usr/share/zoneinfo ${CMAKE_INSTALL_PREFIX}/libexec/darling/private/var/db/timezone/zoneinfo)
 
 install(DIRECTORY DESTINATION libexec/darling/Library/Preferences)
 
 if(NOT DEBIAN_PACKAGING)
 	# only for direct installs; staged (DESTDIR) installs are packaging and must not touch running instances
+	# a container left running would keep using the files being replaced
 	install(CODE "if (\"\$ENV{DESTDIR}\" STREQUAL \"\")
-		execute_process(COMMAND bash ${DARLING_TOP_DIRECTORY}/tools/shutdown-user.sh)
+		execute_process(COMMAND bash \"${DARLING_TOP_DIRECTORY}/tools/shutdown-user.sh\" \"${CMAKE_INSTALL_PREFIX}\"
+			RESULT_VARIABLE DARLING_SHUTDOWN_RESULT)
+		if (NOT DARLING_SHUTDOWN_RESULT STREQUAL \"0\")
+			message(FATAL_ERROR \"Running Darling containers could not be shut down; installation stopped\")
+		endif()
 	endif()")
 endif(NOT DEBIAN_PACKAGING)
 

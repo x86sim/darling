@@ -1,7 +1,7 @@
 /*
  This file is part of Darling.
 
- Copyright (C) 2019 Lubos Dolezel
+ Copyright (C) 2026 Lubos Dolezel
 
  Darling is free software: you can redistribute it and/or modify
  it under the terms of the GNU General Public License as published by
@@ -17,18 +17,48 @@
  along with Darling.  If not, see <http://www.gnu.org/licenses/>.
 */
 
-#import <CloudKit/CKFetchRecordZoneChangesOperation.h>
+#import "CKInternal.h"
 
 @implementation CKFetchRecordZoneChangesOperation
 
-- (NSMethodSignature *)methodSignatureForSelector:(SEL)aSelector
+@synthesize recordZoneIDs = _recordZoneIDs;
+@synthesize configurationsByRecordZoneID = _configurationsByRecordZoneID;
+@synthesize optionsByRecordZoneID = _optionsByRecordZoneID;
+@synthesize fetchAllChanges = _fetchAllChanges;
+@synthesize recordChangedBlock = _recordChangedBlock;
+@synthesize recordWithIDWasDeletedBlock = _recordWithIDWasDeletedBlock;
+@synthesize recordZoneChangeTokensUpdatedBlock = _recordZoneChangeTokensUpdatedBlock;
+@synthesize recordZoneFetchCompletionBlock = _recordZoneFetchCompletionBlock;
+@synthesize fetchRecordZoneChangesCompletionBlock = _fetchRecordZoneChangesCompletionBlock;
+
+- (instancetype)init
 {
-    return [NSMethodSignature signatureWithObjCTypes: "v@:"];
+    if ((self = [super init]))
+        _fetchAllChanges = YES;
+    return self;
 }
 
-- (void)forwardInvocation:(NSInvocation *)anInvocation
+- (instancetype)initWithRecordZoneIDs:(NSArray<CKRecordZoneID *> *)recordZoneIDs configurationsByRecordZoneID:(NSDictionary<CKRecordZoneID *, CKFetchRecordZoneChangesConfiguration *> *)configurationsByRecordZoneID
 {
-    NSLog(@"Stub called: %@ in %@", NSStringFromSelector([anInvocation selector]), [self class]);
+    if ((self = [self init])) {
+        _recordZoneIDs = [recordZoneIDs copy];
+        _configurationsByRecordZoneID = [configurationsByRecordZoneID copy];
+    }
+    return self;
 }
 
+- (instancetype)initWithRecordZoneIDs:(NSArray<CKRecordZoneID *> *)recordZoneIDs optionsByRecordZoneID:(NSDictionary<CKRecordZoneID *, CKFetchRecordZoneChangesOptions *> *)optionsByRecordZoneID
+{
+    if ((self = [self init])) {
+        _recordZoneIDs = [recordZoneIDs copy];
+        _optionsByRecordZoneID = [optionsByRecordZoneID copy];
+    }
+    return self;
+}
+
+- (void)_performWithError:(NSError *)error
+{
+    if (_fetchRecordZoneChangesCompletionBlock)
+        _fetchRecordZoneChangesCompletionBlock(error);
+}
 @end

@@ -16,18 +16,66 @@
  You should have received a copy of the GNU General Public License
  along with Darling.  If not, see <http://www.gnu.org/licenses/>.
 */
-
 #ifndef VECTOR_MAKE_H
 #define VECTOR_MAKE_H
 
+#include <simd/base.h>
 #include <simd/vector_types.h>
 
-inline simd_float3 simd_make_float3(float x, float y, float z) {
-    return (simd_float3){x, y, z};
+/*
+ * simd_make_<type>N: build an N-element vector from scalars or from smaller
+ * and larger vectors (larger vectors are truncated, smaller ones are
+ * extended by the extra arguments).
+ */
+
+#define SIMD_MAKE_FLOATING(T, S)                                              \
+SIMD_FN simd_##T##2 simd_make_##T##2(S x, S y) { return (simd_##T##2){x, y}; }\
+SIMD_FN simd_##T##3 simd_make_##T##3(S x, S y, S z) {                          \
+    return (simd_##T##3){x, y, z};                                            \
+}                                                                             \
+SIMD_FN simd_##T##4 simd_make_##T##4(S x, S y, S z, S w) {                     \
+    return (simd_##T##4){x, y, z, w};                                         \
+}                                                                             \
+SIMD_FN simd_##T##2 simd_make_##T##2(simd_##T##3 v) { return v.xy; }          \
+SIMD_FN simd_##T##2 simd_make_##T##2(simd_##T##4 v) { return v.xy; }          \
+SIMD_FN simd_##T##3 simd_make_##T##3(simd_##T##2 v, S z) {                     \
+    return (simd_##T##3){v.x, v.y, z};                                        \
+}                                                                             \
+SIMD_FN simd_##T##3 simd_make_##T##3(simd_##T##4 v) { return v.xyz; }         \
+SIMD_FN simd_##T##4 simd_make_##T##4(simd_##T##2 v, S z, S w) {                \
+    return (simd_##T##4){v.x, v.y, z, w};                                     \
+}                                                                             \
+SIMD_FN simd_##T##4 simd_make_##T##4(simd_##T##2 a, simd_##T##2 b) {           \
+    return (simd_##T##4){a.x, a.y, b.x, b.y};                                 \
+}                                                                             \
+SIMD_FN simd_##T##4 simd_make_##T##4(simd_##T##3 v, S w) {                     \
+    return (simd_##T##4){v.x, v.y, v.z, w};                                   \
 }
 
-inline simd_uint2 simd_make_uint2(unsigned int x, unsigned int y) {
-    return (simd_uint2){x, y};
+SIMD_MAKE_FLOATING(float, float)
+SIMD_MAKE_FLOATING(double, double)
+#undef SIMD_MAKE_FLOATING
+
+#define SIMD_MAKE_INTEGER(T, S)                                               \
+SIMD_FN simd_##T##2 simd_make_##T##2(S x, S y) { return (simd_##T##2){x, y}; }\
+SIMD_FN simd_##T##3 simd_make_##T##3(S x, S y, S z) {                          \
+    return (simd_##T##3){x, y, z};                                            \
+}                                                                             \
+SIMD_FN simd_##T##4 simd_make_##T##4(S x, S y, S z, S w) {                     \
+    return (simd_##T##4){x, y, z, w};                                         \
+}                                                                             \
+SIMD_FN simd_##T##2 simd_make_##T##2(simd_##T##3 v) { return v.xy; }          \
+SIMD_FN simd_##T##2 simd_make_##T##2(simd_##T##4 v) { return v.xy; }          \
+SIMD_FN simd_##T##3 simd_make_##T##3(simd_##T##4 v) { return v.xyz; }         \
+SIMD_FN simd_##T##3 simd_make_##T##3(simd_##T##2 v, S z) {                     \
+    return (simd_##T##3){v.x, v.y, z};                                        \
+}                                                                             \
+SIMD_FN simd_##T##4 simd_make_##T##4(simd_##T##3 v, S w) {                     \
+    return (simd_##T##4){v.x, v.y, v.z, w};                                   \
 }
+
+SIMD_MAKE_INTEGER(int, int)
+SIMD_MAKE_INTEGER(uint, unsigned int)
+#undef SIMD_MAKE_INTEGER
 
 #endif
