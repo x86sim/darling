@@ -38,6 +38,7 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
 #import <UIFoundation/UIFoundationGraphicsContext.h>
 
 #import "NSBidiHelper.h"
+#import "NSLayoutManager-Private.h"
 
 typedef struct {
     NSRect rect;
@@ -292,10 +293,31 @@ static inline NSGlyphFragment *fragmentAtGlyphIndex(NSLayoutManager *self,
 }
 
 - (BOOL) usesScreenFonts {
-    return YES;
+    return !_doesNotUseScreenFonts;
 }
 
 - (void) setUsesScreenFonts: (BOOL) yorn {
+    if (yorn == [self usesScreenFonts])
+        return;
+    _doesNotUseScreenFonts = !yorn;
+
+    // The glyph advances, and with them the line fragments, depend on the fonts used for layout.
+    NSRange all = NSMakeRange(0, [_textStorage length]);
+    if (all.length > 0) {
+        [self invalidateLayoutForCharacterRange: all isSoft: NO actualCharacterRange: NULL];
+        [self invalidateDisplayForCharacterRange: all];
+    }
+}
+
+// The font the layout, the glyph rects and the drawing use for a font of the
+// text. With usesScreenFonts, that is the font's screen variant, which lays
+// out with the advances macOS uses on screen (whole pixels up to 16 pt, exact
+// above); otherwise the font itself, with exact advances.
+- (NSFont *) _layoutFontForFont: (NSFont *) font {
+    if (font == nil || _doesNotUseScreenFonts)
+        return font;
+    NSFont *screenFont = [font screenFontWithRenderingMode: NSFontDefaultRenderingMode];
+    return screenFont != nil ? screenFont : font;
 }
 
 - (BOOL) showsControlCharacters {
@@ -403,7 +425,7 @@ static inline NSGlyphFragment *fragmentAtGlyphIndex(NSLayoutManager *self,
             [_textStorage attributesAtIndex: characterRange.location
                              effectiveRange: NULL];
 
-    return NSFontAttributeInDictionary(attributes);
+    return [self _layoutFontForFont: NSFontAttributeInDictionary(attributes)];
 }
 
 #define DEBUG_LM_LAYOUT 0
@@ -606,6 +628,8 @@ static inline NSGlyphFragment *fragmentAtGlyphIndex(NSLayoutManager *self,
     return fragment->rect;
 }
 
+static CGFloat _glyphRunWidth(NSFont *font, const NSGlyph *glyphs, NSInteger length);
+
 - (NSPoint) locationForGlyphAtIndex: (NSUInteger) glyphIndex {
 
 #if DEBUG_LM_LAYOUT
@@ -613,7 +637,8 @@ static inline NSGlyphFragment *fragmentAtGlyphIndex(NSLayoutManager *self,
 #define DEBUG_locationForGlyphAtIndex 0
 #endif
 
-    NSGlyphFragment *fragment = fragmentAtGlyphIndex(self, glyphIndex, NULL);
+    NSRange effectiveRange;
+    NSGlyphFragment *fragment = fragmentAtGlyphIndex(self, glyphIndex, &effectiveRange);
 
     if (fragment == NULL) {
 
@@ -628,7 +653,23 @@ static inline NSGlyphFragment *fragmentAtGlyphIndex(NSLayoutManager *self,
     NSLog(@"returning location: %@", NSStringFromPoint(fragment->location));
 #endif
 
-    return fragment->location;
+    NSPoint location = fragment->location;
+
+    // The location of a glyph is the start of its nominally spaced run plus the advances of the glyphs before it.
+    if (fragment->leftToRight && glyphIndex > effectiveRange.location) {
+        NSRange through = NSMakeRange(effectiveRange.location, glyphIndex + 1 - effectiveRange.location);
+        NSGlyph glyphs[through.length];
+        NSUInteger count = [self getGlyphs: glyphs range: through];
+        if (count > 0 && glyphs[count - 1] != NSControlGlyph) {
+            NSFont *font = [self _fontForGlyphRange: through];
+            BOOL ignore;
+            // The width through the glyph itself, less the glyph's own advance: what precedes it, kerning included.
+            location.x += _glyphRunWidth(font, glyphs, count) -
+                          [font positionOfGlyph: glyphs[count - 1] precededByGlyph: NSNullGlyph isNominal: &ignore].x;
+        }
+    }
+
+    return location;
 }
 
 - (NSRect) lineFragmentUsedRectForGlyphAtIndex: (NSUInteger) glyphIndex
@@ -1243,12 +1284,17 @@ static inline NSGlyphFragment *fragmentAtGlyphIndex(NSLayoutManager *self,
                 BOOL ltor = fragment->leftToRight;
 
                 glyphRect.size.width = 0;
+                NSGlyph previousGlyph = NSNullGlyph;
 
                 for (i = 0; i < length; i++) {
                     NSGlyph glyph = glyphs[i];
 
                     if (glyph != NSControlGlyph) {
-                        NSSize advancement = [font advancementForGlyph: glyph];
+                        // The same advance, kerning included, as the typesetter laid the glyph out with.
+                        BOOL ignore;
+                        NSSize advancement = NSMakeSize(
+                                [font positionOfGlyph: glyph precededByGlyph: previousGlyph isNominal: &ignore].x, 0);
+                        previousGlyph = glyph;
 
                         glyphRect.size.width = advancement.width;
 
@@ -1817,6 +1863,13 @@ static void _strokeLines(CGPathRef path, CGFloat lineWidth, CGLineCap lineCap,
         nsglyphs[i] = cgGlyphs[i];
     }
     [font getAdvancements: advances forGlyphs: nsglyphs count: cgGlyphsLength];
+    // The pair kerning the layout gave a glyph moves the glyphs after it.
+    for (NSInteger i = 1; i < cgGlyphsLength; ++i) {
+        BOOL ignore;
+        CGFloat kerning = [font positionOfGlyph: nsglyphs[i] precededByGlyph: nsglyphs[i - 1] isNominal: &ignore].x -
+                          advances[i].width;
+        advances[i - 1].width += kerning;
+    }
 
 #if DEBUG_LM_SHOWPACKEDGLYPHS
     for (NSInteger i = 0; i < cgGlyphsLength; i++) {
@@ -2282,7 +2335,7 @@ static void _strokeLines(CGPathRef path, CGFloat lineWidth, CGLineCap lineCap,
 #endif
 
     NSColor *color = NSForegroundColorAttributeInDictionary(attributes);
-    NSFont *font = NSFontAttributeInDictionary(attributes);
+    NSFont *font = [self _layoutFontForFont: NSFontAttributeInDictionary(attributes)];
 
     // First draw the packed glyphs
     char packedGlyphs[length * 2]; // Specs says length*4+1 but needed buffer
@@ -2432,13 +2485,56 @@ static void _strokeLines(CGPathRef path, CGFloat lineWidth, CGLineCap lineCap,
      * extends upward -- had nowhere to go and was cut off at the fragment's top edge (measured:
      * fragment y=0..24 with the baseline at y=11, so a 24pt attachment started at y=-13). Push the
      * baseline down to the bottom of the taller fragment. For a line with no tall attachment the
-     * fragment is exactly the font's line height and `extra` is zero, so ordinary text is not
-     * moved at all. */
+     * fragment is exactly the line height of its tallest font and `extra` is zero, so ordinary text
+     * is not moved at all. The amount is measured against the tallest font of the whole line
+     * fragment, not the font of this run: every run of the line shares the line's baseline, and a
+     * run in a font with a shorter line height than another font in the same line (a fallback font
+     * for symbols, say) must not be pushed below it. */
     NSFont *runFont = NSFontAttributeInDictionary(attributes);
     if (runFont != nil) {
+        NSRange fragmentGlyphs;
         NSRect lineFragment =
-            [self lineFragmentRectForGlyphAtIndex: range.location effectiveRange: NULL];
-        CGFloat extra = lineFragment.size.height - ceilf([runFont defaultLineHeightForFont]);
+            [self lineFragmentRectForGlyphAtIndex: range.location effectiveRange: &fragmentGlyphs];
+        CGFloat fontHeight = ceilf([runFont defaultLineHeightForFont]);
+        // The typesetter creates one fragment per run of one font, so widen the range to every
+        // fragment of the same line: the same container, the same top and the same height.
+        NSUInteger glyphCount = [self numberOfGlyphs];
+        NSTextContainer *lineContainer = [self textContainerForGlyphAtIndex: range.location
+                                                             effectiveRange: NULL];
+        while (fragmentGlyphs.location > 0) {
+            NSRange previous;
+            NSRect rect = [self lineFragmentRectForGlyphAtIndex: fragmentGlyphs.location - 1
+                                                 effectiveRange: &previous];
+            if (rect.origin.y != lineFragment.origin.y || rect.size.height != lineFragment.size.height ||
+                [self textContainerForGlyphAtIndex: previous.location effectiveRange: NULL] != lineContainer)
+                break;
+            fragmentGlyphs = NSUnionRange(fragmentGlyphs, previous);
+        }
+        while (NSMaxRange(fragmentGlyphs) < glyphCount) {
+            NSRange next;
+            NSRect rect = [self lineFragmentRectForGlyphAtIndex: NSMaxRange(fragmentGlyphs)
+                                                 effectiveRange: &next];
+            if (rect.origin.y != lineFragment.origin.y || rect.size.height != lineFragment.size.height ||
+                [self textContainerForGlyphAtIndex: next.location effectiveRange: NULL] != lineContainer)
+                break;
+            fragmentGlyphs = NSUnionRange(fragmentGlyphs, next);
+        }
+        NSRange fragmentChars = [self characterRangeForGlyphRange: fragmentGlyphs
+                                                 actualGlyphRange: NULL];
+        NSTextStorage *storage = [self textStorage];
+        NSUInteger charIndex = fragmentChars.location;
+        while (storage != nil && charIndex < NSMaxRange(fragmentChars) &&
+               charIndex < [storage length]) {
+            NSRange fontRange;
+            NSFont *lineFont = [storage attribute: NSFontAttributeName
+                                          atIndex: charIndex
+                            longestEffectiveRange: &fontRange
+                                          inRange: fragmentChars];
+            if (lineFont != nil)
+                fontHeight = MAX(fontHeight, ceilf([lineFont defaultLineHeightForFont]));
+            charIndex = NSMaxRange(fontRange);
+        }
+        CGFloat extra = lineFragment.size.height - fontHeight;
         if (extra > 0)
             point.y += isFlipped ? extra : -extra;
     }
@@ -2462,7 +2558,7 @@ static void _strokeLines(CGPathRef path, CGFloat lineWidth, CGLineCap lineCap,
 
         // Prepare the font - we're within an attribute run - so this font will
         // be good for this entire range
-        NSFont *font = NSFontAttributeInDictionary(attributes);
+        NSFont *font = [self _layoutFontForFont: NSFontAttributeInDictionary(attributes)];
         // Sets the font, its size and the text matrix in the current context.
         [font set];
 

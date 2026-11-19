@@ -84,6 +84,7 @@ if (COMPONENT_dev_gui_stubs_common)
 	add_subdirectory(ServiceManagement)
 	add_subdirectory(Quartz)
 	add_subdirectory(QuickLook)
+	add_subdirectory(SafariServices)
 	add_subdirectory(SceneKit)
 	add_subdirectory(SpriteKit)
 	add_subdirectory(UniformTypeIdentifiers)
@@ -98,6 +99,8 @@ if (COMPONENT_gui)
 	add_subdirectory(OpenGL)
 	add_subdirectory(ImageIO)
 	add_subdirectory(UIKit)
+	# iOS's OpenGL ES is the host's (EGL and GLES), reached through mldr.
+	add_subdirectory(OpenGLES)
 endif()
 
 # this is for all the other stubbed frameworks

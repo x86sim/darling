@@ -58,6 +58,10 @@ extern const CFStringRef _kLSArchitectureUnknownValue;
 extern const CFStringRef _kLSArchitectureKey;
 
 extern const CFStringRef _kLSPIDKey;
+
+// Key of the options dictionary of the private open calls: a true value opens
+// the item without bringing the application to the front.
+extern const CFStringRef _kLSOpenOptionBackgroundLaunchKey;
 extern const CFStringRef _kLSExecutablePathKey;
 extern const CFStringRef _kLSCheckInTimeKey;
 extern const CFStringRef _kLSDisplayNameKey;
@@ -103,10 +107,21 @@ LSASNRef _LSASNCreateWithPid(CFAllocatorRef allocator, pid_t pid);
 
 OSStatus _LSLaunchApplication(CFURLRef appPath);
 
+// Shows a file or folder in the host desktop's file manager (the folder containing it with the item selected when
+// reveal is set, otherwise the item opened). No file manager lives in the prefix, so this reaches the host through the
+// desktop portal; kLSApplicationNotFoundErr when it cannot.
+OSStatus _LSOpenFileOnHost(CFURLRef fileURL, Boolean reveal);
+
 Boolean _LSASNExtractHighAndLowParts(LSASNRef asn, UInt32* outHigh, UInt32* outLow);
 // ASNs of all live processes, ordered by PID.
 CFArrayRef _LSCopyApplicationArray(LSSessionID sessionID);
 OSStatus _LSSetWeakBindingURLForType(LSSessionID sessionID, int unknown, CFStringRef contentType, LSRolesMask roles, CFURLRef appURL);
+
+// The URL of the icon file that shows documents of a content type, or NULL when no application declares one
+// (the caller then uses a generic icon). Looks at the icon of the type's own declaration (UTTypeIconFile), then at the
+// icon in CFBundleDocumentTypes of the handler application (the user's choice, else by handler rank). Follows the
+// Create rule. Only the file is located; callers load it as they see fit.
+CFURLRef _LSCopyIconURLForContentType(CFStringRef contentType);
 
 // Assumed
 #define kLSDownloadRiskCategoryKey CFSTR("LSDownloadRiskCategory")
