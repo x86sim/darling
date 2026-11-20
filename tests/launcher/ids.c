@@ -335,6 +335,18 @@ static void test_drop_privileges(void)
 		CHECK(!launcherDropPrivileges(&ids));
 	}
 
+	// In an unprivileged user namespace (unshare -r) setgroups() is denied for
+	// good, but there the list is still the user's: it is left alone.
+	fullyRoot();
+	k.ngroups = ids.ngroups;
+	memcpy(k.groups, ids.groups, ids.ngroups * sizeof(gid_t));
+	resetCalls();
+	g_failCall = "setgroups";
+	CHECK(launcherDropPrivileges(&ids));
+	CHECK(calledAt("setgroups") < 0);
+	CHECK(uidsAre(USER_UID, USER_UID, USER_UID));
+	g_failCall = NULL;
+
 	// Dropping only the effective uid (as seteuid() would) leaves the saved uid 0.
 	fullyRoot();
 	g_ignoreCall = "setresuid";

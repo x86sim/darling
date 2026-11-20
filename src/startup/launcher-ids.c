@@ -151,8 +151,10 @@ bool launcherDropPrivileges(const struct launcher_ids* ids)
 	// Runs as root. The supplementary groups and the gids can only be changed
 	// while the uid is still 0, so they go first and the uids last. Setting the
 	// supplementary groups to the user's own list keeps exactly the access the
-	// user had when starting the launcher.
-	if (setgroups(ids->ngroups, ids->groups) != 0)
+	// user had when starting the launcher. When the list is already the user's
+	// it is left alone: in an unprivileged user namespace (x86Sim's userns mode,
+	// unshare -r) setgroups() is denied for good, and the list never changed.
+	if (!groupsAre(ids) && setgroups(ids->ngroups, ids->groups) != 0)
 		return false;
 	if (setresgid(gid, gid, gid) != 0)
 		return false;
