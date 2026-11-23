@@ -487,4 +487,4 @@
 	branch = v1.20
 [submodule "src/external/lsof"]
 	path = src/external/lsof
-	url = https://github.com/darlinghq/darling-lsof.git
+	url = ../darling-lsof.git
