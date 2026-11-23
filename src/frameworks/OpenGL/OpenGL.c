@@ -14,8 +14,15 @@
 #include <OpenGL/CGLRenderers.h>
 #include <OpenGL/glext.h>
 #include <OpenGL/CGLInternal.h>
+#include <OpenGL/gliDispatch.h>
+#include <stddef.h>
+// The layout check below compares this file's context struct with the public one.
+#define _CGLContextObject _CGLContextObjectPublic
+#include <OpenGL/CGLContext.h>
+#undef _CGLContextObject
 #include <CoreFoundation/CFDictionary.h>
 #include <CoreFoundation/CFRunLoop.h>
+#include <CoreFoundation/CFNotificationCenter.h>
 #include <sys/time.h>
 #include <IOSurface/IOSurface.h>
 #include <IOSurface/IOSurfacePriv.h>
@@ -43,6 +50,7 @@
 #endif
 
 #include "swap_pacing.h"
+#include "gl_exports.h"
 #include "drm_formats.h"
 
 #ifndef EGL_PLATFORM_WAYLAND_KHR
@@ -614,7 +622,13 @@ static pthread_cond_t g_bindingCond = PTHREAD_COND_INITIALIZER;
 
 struct cgl_profile_strings;
 
-struct _CGLContextObj {
+struct _CGLContextObject {
+    // The first four members are the public layout (see CGLContext.h): code
+    // built with CGLMacro.h reads rend and calls through disp.
+    GLIContext rend;
+    GLIFunctionDispatch disp;
+    CGLPrivateObj priv;
+    void *stak;
     GLuint retain_count;
     pthread_mutex_t lock;
     EGLDisplay egl_display;
@@ -653,8 +667,13 @@ struct _CGLContextObj {
     // first use, and the framebuffers a blit copy uses.
     int gpu_copy;
     GLuint copy_framebuffers[2];
-    struct _CGLContextObj *prev_active;
-    struct _CGLContextObj *next_active;
+    // Contexts that share object state (textures among them) have the same
+    // share group number.
+    uint64_t share_group;
+    // GL_MAX_COLOR_ATTACHMENTS, found out on first use (0 until then).
+    GLint max_color_attachments;
+    struct _CGLContextObject *prev_active;
+    struct _CGLContextObject *next_active;
     // Which thread the EGL context is bound to (see the thread hand-off
     // notes above setCurrentContext). Guarded by g_bindingMutex.
     enum cgl_binding binding;
@@ -668,13 +687,23 @@ struct _CGLContextObj {
     // The main thread waits for a thread other than the main thread to
     // release the binding (at its next CGLLockContext or CGLUnlockContext).
     int release_wanted;
+    // Counts how often the binding was given up (parked or freed), so that a
+    // thread that waited for one can tell it happened even if the binding was
+    // taken again before the thread woke up. Guarded by g_bindingMutex.
+    unsigned release_count;
     // Nesting depth of CGLLockContext and the thread holding it; only that
     // thread writes them, under the context's lock.
     unsigned lock_depth;
     pthread_t lock_owner;
 };
 
-static struct _CGLContextObj *g_activeContexts = NULL;
+_Static_assert(offsetof(struct _CGLContextObject, rend) == offsetof(struct _CGLContextObjectPublic, rend) &&
+               offsetof(struct _CGLContextObject, disp) == offsetof(struct _CGLContextObjectPublic, disp) &&
+               offsetof(struct _CGLContextObject, priv) == offsetof(struct _CGLContextObjectPublic, priv) &&
+               offsetof(struct _CGLContextObject, stak) == offsetof(struct _CGLContextObjectPublic, stak),
+               "the context starts with the public layout");
+
+static struct _CGLContextObject *g_activeContexts = NULL;
 static pthread_mutex_t g_activeContextsMutex = PTHREAD_MUTEX_INITIALIZER;
 
 struct _CGLPixelFormatObj {
@@ -706,6 +735,7 @@ static inline int attribute_has_argument(CGLPixelFormatAttribute attr) {
 }
 
 static void writeBackSurface(IOSurfaceRef ioSurface);
+static void finishSurface(IOSurfaceRef ioSurface);
 
 __attribute__((constructor))
 static void _CGLInitialize(void)
@@ -714,10 +744,13 @@ static void _CGLInitialize(void)
 
     // A binding retains its surface, so a surface is never freed while
     // this framework has state for it and no forget callback is needed.
+    // Rendering into textures is reported to IOSurface as it is noted (see
+    // "Writing GL rendering back into surfaces").
     static const _IOSurfaceGPUCallbacks callbacks = {
-        .version = _IOSURFACE_GPU_CALLBACKS_VERSION,
+        .version = _IOSURFACE_GPU_CALLBACKS_VERSION_REPORTS_WRITES,
         .writeback = writeBackSurface,
         .forget = NULL,
+        .finish = finishSurface,
     };
     _IOSurfaceSetGPUCallbacks(&callbacks);
 }
@@ -861,7 +894,33 @@ struct _CGLWindow {
     EGLDisplay display;
     EGLConfig config;
     EGLSurface surface;
+    // The window-system handle the surface was made for, and the list of live
+    // windows (guarded by g_windowsMutex) that a swap uses to find it.
+    void *native_window;
+    struct _CGLWindow *next;
 };
+
+static pthread_mutex_t g_windowsMutex = PTHREAD_MUTEX_INITIALIZER;
+static struct _CGLWindow *g_windows;
+
+// After a swap on a window surface, tells whoever presents that native
+// window (its window-system backend, which lives above this framework) that a
+// new frame is ready. The notification is posted on the swapping thread to the
+// local notification center, with the native window handle as its object.
+static void postWindowDidSwap(EGLSurface surface) {
+    void *native = NULL;
+    pthread_mutex_lock(&g_windowsMutex);
+    for (struct _CGLWindow *window = g_windows; window != NULL; window = window->next) {
+        if (window->surface == surface) {
+            native = window->native_window;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_windowsMutex);
+    if (native != NULL)
+        CFNotificationCenterPostNotification(CFNotificationCenterGetLocalCenter(),
+            kCGLWindowDidSwapNotification, native, NULL, true);
+}
 
 static CGLWindowRef createWindow(EGLDisplay owner, EGLConfig owner_config, void *native_window) {
     if (!native_window || owner == EGL_NO_DISPLAY)
@@ -877,6 +936,11 @@ static CGLWindowRef createWindow(EGLDisplay owner, EGLConfig owner_config, void 
         free(window);
         return NULL;
     }
+    window->native_window = native_window;
+    pthread_mutex_lock(&g_windowsMutex);
+    window->next = g_windows;
+    g_windows = window;
+    pthread_mutex_unlock(&g_windowsMutex);
     return window;
 }
 
@@ -932,6 +996,8 @@ CGLWindowRef CGLGetWindowWithAlpha(void *native_window, unsigned long visual_id)
     return window;
 }
 
+static int threadHoldsBinding(CGLContextObj context);
+
 CGL_EXPORT void CGLDestroyWindow(CGLWindowRef ref) {
     struct _CGLWindow *window = ref;
     if (!window)
@@ -942,7 +1008,7 @@ CGL_EXPORT void CGLDestroyWindow(CGLWindowRef ref) {
 
     if (window->surface != EGL_NO_SURFACE) {
         pthread_mutex_lock(&g_activeContextsMutex);
-        for (struct _CGLContextObj *ctx = g_activeContexts; ctx != NULL; ctx = ctx->next_active) {
+        for (struct _CGLContextObject *ctx = g_activeContexts; ctx != NULL; ctx = ctx->next_active) {
             EGLSurface target = window->surface;
             if (atomic_compare_exchange_strong_explicit(&ctx->egl_surface, &target, (EGLSurface)EGL_NO_SURFACE,
                                                         memory_order_acq_rel, memory_order_acquire)) {
@@ -954,11 +1020,26 @@ CGL_EXPORT void CGLDestroyWindow(CGLWindowRef ref) {
         pthread_mutex_unlock(&g_activeContextsMutex);
     }
 
+    // Disassociate the destroyed window surface from the current EGL thread,
+    // if this thread holds the context (a context that is current here but not
+    // held is bound without the surface the next time, and binding it here
+    // would bypass the record of which thread holds it).
     if (current_cleared && current && current->egl_display != EGL_NO_DISPLAY) {
-        // Disassociate the destroyed window surface from the current EGL thread
-        p_eglMakeCurrent(current->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, current->egl_context);
+        pthread_mutex_lock(&g_bindingMutex);
+        int held = threadHoldsBinding(current);
+        pthread_mutex_unlock(&g_bindingMutex);
+        if (held)
+            p_eglMakeCurrent(current->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, current->egl_context);
     }
 
+    pthread_mutex_lock(&g_windowsMutex);
+    for (struct _CGLWindow **link = &g_windows; *link != NULL; link = &(*link)->next) {
+        if (*link == window) {
+            *link = window->next;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_windowsMutex);
     p_eglDestroySurface(window->display, window->surface);
     free(window);
 }
@@ -1132,21 +1213,42 @@ static int threadHoldsBinding(CGLContextObj context) {
 // ("parked").
 static void releaseRequestedBinding(CGLContextObj context) {
     pthread_mutex_lock(&g_bindingMutex);
-    context->release_pending = 0;
-    // Not while this thread is inside CGLLockContext (a nested run loop).
+    // Not while this thread is inside CGLLockContext (a nested lock, or a
+    // nested run loop): it is drawing with the context. The request stays
+    // pending, and the thread that made it keeps waiting, until
+    // CGLUnlockContext of the outermost lock answers it.
     int in_lock = context->lock_depth > 0 && pthread_equal(context->lock_owner, pthread_self());
-    if (threadHoldsBinding(context) && !in_lock &&
-        p_eglMakeCurrent(context->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT))
+    if (in_lock && threadHoldsBinding(context)) {
+        pthread_mutex_unlock(&g_bindingMutex);
+        return;
+    }
+    context->release_pending = 0;
+    if (threadHoldsBinding(context) &&
+        p_eglMakeCurrent(context->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT)) {
         context->binding = CGL_BINDING_PARKED;
+        context->release_count++;
+        if (gl_tls_bound == context)
+            gl_tls_bound = NULL;
+    }
     pthread_cond_broadcast(&g_bindingCond);
     pthread_mutex_unlock(&g_bindingMutex);
+}
+
+// Parks the calling (main) thread's binding if other threads use the context
+// or asked for it.
+static void parkMultiThreadBinding(CGLContextObj context) {
+    pthread_mutex_lock(&g_bindingMutex);
+    int park = (context->multi_thread || context->release_pending) && threadHoldsBinding(context);
+    pthread_mutex_unlock(&g_bindingMutex);
+    if (park)
+        releaseRequestedBinding(context);
 }
 
 // Run loop observer (on the main run loop): parks the main thread's binding
 // of every context that other threads use. Runs on the main thread only.
 static void parkMultiThreadBindings(void) {
     pthread_mutex_lock(&g_activeContextsMutex);
-    for (struct _CGLContextObj *ctx = g_activeContexts; ctx != NULL; ctx = ctx->next_active) {
+    for (struct _CGLContextObject *ctx = g_activeContexts; ctx != NULL; ctx = ctx->next_active) {
         pthread_mutex_lock(&g_bindingMutex);
         int park = ctx->multi_thread && threadHoldsBinding(ctx);
         pthread_mutex_unlock(&g_bindingMutex);
@@ -1156,12 +1258,15 @@ static void parkMultiThreadBindings(void) {
     pthread_mutex_unlock(&g_activeContextsMutex);
 }
 
-// Marks context as used by more than one thread and makes sure the main run
-// loop parks the main thread's binding whenever it goes idle.
-static void noteMultiThread(CGLContextObj context) {
+// Makes sure the main run loop gives up the main thread's bindings of contexts
+// that other threads use whenever it goes idle: the main thread then holds such
+// a context's binding only while it uses it, and its next GL call takes the
+// binding again. A context that no other thread has used or asked for keeps
+// its binding across idle: unbinding and rebinding every single-thread
+// context at every pass of the run loop is not what its application expects.
+static void ensureIdleObserver(void) {
     static int observer_added;
     pthread_mutex_lock(&g_bindingMutex);
-    context->multi_thread = 1;
     int add = !observer_added;
     observer_added = 1;
     pthread_mutex_unlock(&g_bindingMutex);
@@ -1178,6 +1283,14 @@ static void noteMultiThread(CGLContextObj context) {
         CFRunLoopAddObserver(CFRunLoopGetMain(), observer, kCFRunLoopCommonModes);
         CFRelease(observer);
     }
+}
+
+// Marks context as used by more than one thread.
+static void noteMultiThread(CGLContextObj context) {
+    pthread_mutex_lock(&g_bindingMutex);
+    context->multi_thread = 1;
+    pthread_mutex_unlock(&g_bindingMutex);
+    ensureIdleObserver();
 }
 
 // Runs on the main thread's run loop. The context was retained for it.
@@ -1222,6 +1335,9 @@ static void releaseWantedBinding(CGLContextObj context) {
     if (context->release_wanted && threadHoldsBinding(context) &&
         p_eglMakeCurrent(context->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT)) {
         context->binding = CGL_BINDING_PARKED;
+        context->release_count++;
+        if (gl_tls_bound == context)
+            gl_tls_bound = NULL;
         context->release_wanted = 0;
         pthread_cond_broadcast(&g_bindingCond);
     }
@@ -1233,11 +1349,15 @@ static void releaseWantedBinding(CGLContextObj context) {
 static int requestRelease(CGLContextObj context) {
     noteMultiThread(context);
     pthread_mutex_lock(&g_bindingMutex);
-    if (context->binding != CGL_BINDING_BOUND || context->release_pending) {
+    // The holder gave the binding up between the refused bind and here: bind
+    // again.
+    if (context->binding != CGL_BINDING_BOUND) {
         pthread_mutex_unlock(&g_bindingMutex);
-        return 0;
+        return 1;
     }
     struct timespec deadline = handoffDeadline();
+    unsigned start = context->release_count;
+    int released;
     if (!context->binding_thread_is_main) {
         // Another thread than the main thread holds the context and the main
         // thread, for which a context is current whatever other threads do,
@@ -1248,12 +1368,12 @@ static int requestRelease(CGLContextObj context) {
             return 0;
         }
         context->release_wanted = 1;
-        while (context->binding == CGL_BINDING_BOUND && context->release_wanted) {
+        while (context->release_count == start && context->release_wanted) {
             if (pthread_cond_timedwait(&g_bindingCond, &g_bindingMutex, &deadline) != 0)
                 break;
         }
         context->release_wanted = 0;
-        int released = context->binding != CGL_BINDING_BOUND;
+        released = context->release_count != start;
         pthread_mutex_unlock(&g_bindingMutex);
         return released;
     }
@@ -1261,30 +1381,37 @@ static int requestRelease(CGLContextObj context) {
         pthread_mutex_unlock(&g_bindingMutex);
         return 0;
     }
-    context->release_pending = 1;
-    CGLRetainContext(context);
-    CFRunLoopRef main_loop = CFRunLoopGetMain();
-    CFRunLoopPerformBlock(main_loop, kCFRunLoopCommonModes, ^{ releaseBindingOnThisThread(context); });
-    CFRunLoopWakeUp(main_loop);
-    while (context->binding == CGL_BINDING_BOUND && context->release_pending) {
+    if (!context->release_pending) {
+        context->release_pending = 1;
+        CGLRetainContext(context);
+        CFRunLoopRef main_loop = CFRunLoopGetMain();
+        CFRunLoopPerformBlock(main_loop, kCFRunLoopCommonModes, ^{ releaseBindingOnThisThread(context); });
+        CFRunLoopWakeUp(main_loop);
+    }
+    // (A request that another thread made is waited for in the same way.)
+    while (context->release_count == start && context->release_pending) {
         if (pthread_cond_timedwait(&g_bindingCond, &g_bindingMutex, &deadline) != 0)
             break;
     }
-    int released = context->binding != CGL_BINDING_BOUND;
+    released = context->release_count != start;
+    // No answer in time: do not leave the request pending, or no later
+    // refusal could ask again.
+    if (!released)
+        context->release_pending = 0;
     pthread_mutex_unlock(&g_bindingMutex);
     return released;
 }
 
 // Makes context current without bringing IOSurface contents into its
 // rectangle textures; used inside this framework.
-static CGLError setCurrentContext(CGLContextObj context) {
+static CGLError setCurrentContextEx(CGLContextObj context, int may_wait) {
     CGLContextObj previous = CGLGetCurrentContext();
     CGLError error = bindCurrentContext(context);
     // A bind that fails because another thread holds the context asks that
     // thread to release it; the thread that got released may bind it again
     // before this one does (or be in the middle of binding it), so try again
     // a few times.
-    for (int attempt = 0; error != kCGLNoError && context != NULL && attempt < 20; attempt++) {
+    for (int attempt = 0; may_wait && error != kCGLNoError && context != NULL && attempt < 20; attempt++) {
         pthread_mutex_lock(&g_bindingMutex);
         int held_elsewhere = context->binding == CGL_BINDING_BOUND &&
                              !pthread_equal(context->binding_thread, pthread_self());
@@ -1293,7 +1420,9 @@ static CGLError setCurrentContext(CGLContextObj context) {
         if (held_elsewhere) {
             if (!requestRelease(context))
                 break;
-        } else if (multi_thread) {
+        } else if (multi_thread || attempt < 5) {
+            // Another thread may be in the middle of binding the context (its
+            // binding is recorded only after EGL accepted it): try again.
             usleep(1000);
         } else {
             break;
@@ -1303,28 +1432,181 @@ static CGLError setCurrentContext(CGLContextObj context) {
     pthread_mutex_lock(&g_bindingMutex);
     if (error == kCGLNoError) {
         // Binding another context (or none) releases the previous one.
-        if (previous != NULL && previous != context && threadHoldsBinding(previous))
+        if (previous != NULL && previous != context && threadHoldsBinding(previous)) {
             previous->binding = CGL_BINDING_FREE;
+            previous->release_count++;
+            gl_tls_bound = NULL;
+            // A thread that was refused the context may be waiting for this.
+            pthread_cond_broadcast(&g_bindingCond);
+        }
         if (context != NULL) {
             context->binding = CGL_BINDING_BOUND;
             context->binding_thread = pthread_self();
             context->binding_thread_is_main = pthread_main_np();
         }
+        gl_tls_bound = context;
     }
     pthread_mutex_unlock(&g_bindingMutex);
     return error;
 }
 
+static CGLError setCurrentContext(CGLContextObj context) {
+    return setCurrentContextEx(context, 1);
+}
+
 static void refreshRectangleTextures(CGLContextObj context);
 
+// For a context that more than one thread uses, making it current only
+// records it as this thread's current context: the host binding is taken by the
+// first GL call (see gl_acquire_binding) and given up again at the outermost
+// CGLUnlockContext, so that no thread keeps the binding while it does
+// something else. Without this a thread that makes the context current and
+// then waits (for an application lock, say) keeps the others from it.
+static int setCurrentContextLazily(CGLContextObj context) {
+    pthread_mutex_lock(&g_bindingMutex);
+    int lazy = context->multi_thread && !threadHoldsBinding(context);
+    pthread_mutex_unlock(&g_bindingMutex);
+    if (!lazy || !native_egl_available())
+        return 0;
+    CGLContextObj previous = CGLGetCurrentContext();
+    if (previous != NULL && previous != context) {
+        pthread_mutex_lock(&g_bindingMutex);
+        if (threadHoldsBinding(previous) &&
+            p_eglMakeCurrent(previous->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT)) {
+            previous->binding = CGL_BINDING_FREE;
+            previous->release_count++;
+            if (gl_tls_bound == previous)
+                gl_tls_bound = NULL;
+            pthread_cond_broadcast(&g_bindingCond);
+        }
+        pthread_mutex_unlock(&g_bindingMutex);
+    }
+    pthread_setspecific(get_current_context_key(), context);
+    return 1;
+}
+
 CGLError CGLSetCurrentContext(CGLContextObj context) {
-    CGLError error = setCurrentContext(context);
+    CGLError error = (context != NULL && setCurrentContextLazily(context)) ? kCGLNoError : setCurrentContext(context);
     // A context that becomes current is about to be used, so rectangle
     // textures specified from surfaces the CPU has written since get the
     // new contents.
     if (error == kCGLNoError && context != NULL)
         refreshRectangleTextures(context);
     return error;
+}
+
+// The dispatch table of a context (CGL_MACRO). Each entry makes the context
+// current on the calling thread when it is not, and calls the host function.
+static int gli_enter(GLIContext rend) {
+    CGLContextObj context = (CGLContextObj) rend;
+    if (CGLGetCurrentContext() != context)
+        CGLSetCurrentContext(context);
+    if (GL_BOUND_HERE())
+        return 1;
+    return gl_acquire_binding();
+}
+
+__thread void *gl_tls_bound;
+
+static void gli_missing(void) {}
+
+// The host's OpenGL library (the wrapper this framework re-exports): where the
+// real functions live, as the framework's own gl* exports have the same names.
+// It is not the public libGL.dylib, which re-exports this framework.
+static void *gl_native_handle(void) {
+    static void *handle;
+    if (handle == NULL)
+        handle = dlopen(GL_HOST_LIBRARY, RTLD_LAZY);
+    return handle;
+}
+
+static void *gl_native_symbol(const char *name) {
+    void *handle = gl_native_handle();
+    return handle != NULL ? dlsym(handle, name) : NULL;
+}
+
+// may_wait: a thread refused the context waits for the thread that holds it to
+// give it up (see requestRelease); without it the refusal is final.
+static int acquireBinding(int may_wait) {
+    CGLContextObj context = CGLGetCurrentContext();
+    if (context == NULL)
+        return 0;
+    if (setCurrentContextEx(context, may_wait) != kCGLNoError)
+        return 0;
+    if (gl_tls_bound == NULL)
+        return 0;
+    // Outside CGLLockContext, on a context that other threads use, the binding
+    // is only for this call.
+    pthread_mutex_lock(&g_bindingMutex);
+    int in_lock = context->lock_depth > 0 && pthread_equal(context->lock_owner, pthread_self());
+    int transient = context->multi_thread && !in_lock;
+    pthread_mutex_unlock(&g_bindingMutex);
+    return transient ? 2 : 1;
+}
+
+int gl_acquire_binding(void) {
+    return acquireBinding(1);
+}
+
+void gl_release_transient(void) {
+    CGLContextObj context = gl_tls_bound;
+    if (context == NULL)
+        return;
+    pthread_mutex_lock(&g_bindingMutex);
+    if (threadHoldsBinding(context) &&
+        p_eglMakeCurrent(context->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT)) {
+        context->binding = CGL_BINDING_PARKED;
+        context->release_count++;
+        gl_tls_bound = NULL;
+        pthread_cond_broadcast(&g_bindingCond);
+    }
+    pthread_mutex_unlock(&g_bindingMutex);
+}
+
+extern const char *const gl_export_names[];
+
+// Called by the generated trampolines (gl_trampolines.c) of the host names no
+// signature is known for, with the argument registers saved. The binding is
+// kept: nothing is left to run after the host function.
+void *gl_trampoline_target(unsigned index) {
+    if (!GL_BOUND_HERE())
+        gl_acquire_binding();
+    void *function = gl_trampoline_functions[index];
+    if (function == NULL) {
+        function = gl_native_symbol(gl_trampoline_names[index]);
+        if (function == NULL)
+            function = (void *) gli_missing;
+        gl_trampoline_functions[index] = function;
+    }
+    return function;
+}
+
+void *gl_resolve_real(unsigned index) {
+    void *function = gl_native_symbol(gl_export_names[index]);
+    if (function == NULL)
+        function = (void *) gli_missing;
+    gl_real_functions[index] = function;
+    return function;
+}
+
+static void *gli_host(unsigned slot);
+
+#include "gli_thunks.inc"
+
+_Static_assert(sizeof(GLIFunctionDispatch) == GLI_SLOT_COUNT * sizeof(void *), "one pointer per dispatch slot");
+
+static void *gli_host_functions[975];
+
+static void *gli_host(unsigned slot) {
+    void *function = gli_host_functions[slot];
+    if (function == NULL) {
+        for (const char *const *name = gli_host_names[slot]; *name != NULL && function == NULL; name++)
+            function = gl_native_symbol(*name);
+        if (function == NULL)
+            function = (void *) gli_missing;
+        gli_host_functions[slot] = function;
+    }
+    return function;
 }
 
 static int enable_bit(CGLContextEnable pname) {
@@ -1569,13 +1851,19 @@ CGLError CGLClearDrawable(CGLContextObj ctx)
     atomic_store_explicit(&ctx->egl_surface, (EGLSurface)EGL_NO_SURFACE, memory_order_release);
     int is_current = (CGLGetCurrentContext() == ctx);
     pthread_mutex_unlock(&ctx->lock);
+    // Whether this thread holds the context: only then is the surface detached
+    // from the EGL binding here. A context that is current but not held is
+    // bound without it the next time (see bindCurrentContext).
+    pthread_mutex_lock(&g_bindingMutex);
+    int held = is_current && threadHoldsBinding(ctx);
+    pthread_mutex_unlock(&g_bindingMutex);
 
     /* egl_display and egl_context are immutable after CGLCreateContext */
     if (ctx->egl_display != EGL_NO_DISPLAY) {
         if (old_fallback != EGL_NO_SURFACE) {
             p_eglDestroySurface(ctx->egl_display, old_fallback);
         }
-        if (is_current) {
+        if (held) {
             // Disassociate any surface from the current thread's EGL context
             p_eglMakeCurrent(ctx->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, ctx->egl_context);
         }
@@ -1587,7 +1875,8 @@ CGLError CGLClearDrawable(CGLContextObj ctx)
         if (is_current && fullscreen_surface != EGL_NO_SURFACE) {
             const EGLint pbufferAttribs[] = { EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE };
             EGLSurface pbuf = p_eglCreatePbufferSurface(ctx->egl_display, ctx->egl_config, pbufferAttribs);
-            if (pbuf != EGL_NO_SURFACE && p_eglMakeCurrent(ctx->egl_display, pbuf, pbuf, ctx->egl_context)) {
+            if (pbuf != EGL_NO_SURFACE
+                && (!held || p_eglMakeCurrent(ctx->egl_display, pbuf, pbuf, ctx->egl_context))) {
                 pthread_mutex_lock(&ctx->lock);
                 ctx->fallback_pbuffer = pbuf;
                 atomic_store_explicit(&ctx->egl_surface, pbuf, memory_order_release);
@@ -1736,13 +2025,17 @@ static CGLError createContext(CGLPixelFormatObj pixelFormat, CGLContextObj share
         return egl_share != EGL_NO_CONTEXT ? kCGLBadMatch : kCGLBadContext;
     }
 
-    CGLContextObj context = malloc(sizeof(struct _CGLContextObj));
+    CGLContextObj context = malloc(sizeof(struct _CGLContextObject));
 
     if (context == NULL) {
         p_eglDestroyContext(owner, egl_context);
         return kCGLBadAlloc;
     }
 
+    context->rend = (GLIContext) context;
+    memcpy(&context->disp, gli_template, sizeof(context->disp));
+    context->priv = NULL;
+    context->stak = NULL;
     context->retain_count = 1;
     pthread_mutexattr_t lock_attr;
     pthread_mutexattr_init(&lock_attr);
@@ -1775,6 +2068,9 @@ static CGLError createContext(CGLPixelFormatObj pixelFormat, CGLContextObj share
     atomic_init(&context->dmabuf_import, 0);
     context->gpu_copy = 0;
     context->copy_framebuffers[0] = context->copy_framebuffers[1] = 0;
+    static _Atomic uint64_t lastShareGroup;
+    context->share_group = share ? share->share_group : atomic_fetch_add(&lastShareGroup, 1) + 1;
+    context->max_color_attachments = 0;
 
     pthread_mutex_lock(&g_activeContextsMutex);
     context->prev_active = NULL;
@@ -1914,15 +2210,10 @@ CGLError CGLLockContext(CGLContextObj context) {
         context->lock_owner = pthread_self();
         pthread_mutex_unlock(&g_bindingMutex);
     }
-    if (context->lock_depth == 1 && CGLGetCurrentContext() == context) {
-        // Take back a binding that was handed to another thread or parked
-        // (see the thread hand-off notes at setCurrentContext).
-        pthread_mutex_lock(&g_bindingMutex);
-        int rebind = context->multi_thread && !threadHoldsBinding(context);
-        pthread_mutex_unlock(&g_bindingMutex);
-        if (rebind)
-            setCurrentContext(context);
-    }
+    // The binding that was handed to another thread or parked is not taken
+    // back here: the first GL call of this thread on the context does that (see
+    // gl_acquire_binding), so a thread that only locks the context never waits
+    // for the thread that holds the binding.
     // Locking the current context precedes drawing with it, so rectangle
     // textures specified from surfaces the CPU has written since get the
     // new contents.
@@ -1940,15 +2231,20 @@ CGLError CGLUnlockContext(CGLContextObj context) {
         context->lock_owner = (pthread_t) 0;
         pthread_mutex_unlock(&g_bindingMutex);
         releaseWantedBinding(context);
+        // A thread's use of a context other threads use ends with the outermost
+        // unlock: park the binding now (it also answers a request
+        // that arrived while the lock was held, see releaseRequestedBinding).
+        // macOS leaves a context that several threads use unsafe to touch
+        // without the lock, and a thread that wants the context while the
+        // main thread is blocked outside this framework (on an application
+        // lock, say) would otherwise wait for a binding nobody gives up.
+        parkMultiThreadBinding(context);
     }
     pthread_mutex_unlock(&(context->lock));
     return kCGLNoError;
 }
 
-CGLError CGLFlushDrawable(CGLContextObj context) {
-    if (context == NULL) {
-        return kCGLBadContext;
-    }
+static CGLError flushDrawable(CGLContextObj context) {
     EGLSurface surf = atomic_load_explicit(&context->egl_surface, memory_order_acquire);
     if (surf == EGL_NO_SURFACE) {
         glFlush();
@@ -1971,7 +2267,25 @@ CGLError CGLFlushDrawable(CGLContextObj context) {
     if (context->paced)
         cgl_swap_pace(&context->pacer, context->swap_interval);
     EGLBoolean ok = p_eglSwapBuffers(context->egl_display, surf);
+    if (ok)
+        postWindowDidSwap(surf);
     return ok ? kCGLNoError : kCGLBadDrawable;
+}
+
+CGLError CGLFlushDrawable(CGLContextObj context) {
+    if (context == NULL) {
+        return kCGLBadContext;
+    }
+    // Another thread may hold the host binding of the context that is current
+    // here, or the thread's own was parked or given up: get it (see
+    // gl_acquire_binding), and give a binding taken for this call up again.
+    int acquired = 1;
+    if (!GL_BOUND_HERE() && CGLGetCurrentContext() == context)
+        acquired = gl_acquire_binding();
+    CGLError error = flushDrawable(context);
+    if (acquired == 2)
+        gl_release_transient();
+    return error;
 }
 
 // GL_APPLE_flush_render: swaps the drawable of the current context, like
@@ -1982,6 +2296,75 @@ void glSwapAPPLE(void) {
     if (context != NULL)
         CGLFlushDrawable(context);
 }
+
+// GL functions this framework exports in place of the host's, so that
+// rendering into IOSurface-backed textures reaches the surfaces (see
+// "Writing GL rendering back into surfaces" below). The framework's own
+// calls go straight to the host's through these.
+#define CGL_HOST_GL_FUNCTIONS(X) \
+    X(glFlush) \
+    X(glFinish) \
+    X(glFenceSync) \
+    X(glDeleteTextures) \
+    X(glTexImage2D) \
+    X(glBindFramebuffer) \
+    X(glBindFramebufferEXT) \
+    X(glDeleteFramebuffers) \
+    X(glDeleteFramebuffersEXT) \
+    X(glGetFramebufferAttachmentParameteriv)
+
+#define CGL_HOST_GL_DECLARE(name) static __typeof__(name) *p_host_##name;
+CGL_HOST_GL_FUNCTIONS(CGL_HOST_GL_DECLARE)
+#undef CGL_HOST_GL_DECLARE
+
+// The library this framework re-exports the host's GL functions from.
+#define CGL_HOST_GL_LIBRARY GL_HOST_LIBRARY
+
+static void load_host_gl(void) {
+    void *library = dlopen(CGL_HOST_GL_LIBRARY, RTLD_LAZY | RTLD_LOCAL);
+    if (!library)
+        return;
+#define CGL_HOST_GL_LOAD(name) p_host_##name = (__typeof__(p_host_##name)) dlsym(library, #name);
+    CGL_HOST_GL_FUNCTIONS(CGL_HOST_GL_LOAD)
+#undef CGL_HOST_GL_LOAD
+}
+
+static void ensure_host_gl(void) {
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    pthread_once(&once, load_host_gl);
+}
+
+// host_glFlush() and so on: the host's function, or nothing without one.
+#define CGL_HOST_GL_CALL(result, name, params, args) \
+    static result host_##name params { \
+        ensure_host_gl(); \
+        if (p_host_##name) \
+            return p_host_##name args; \
+        return (result) 0; \
+    }
+#define CGL_HOST_GL_CALL_VOID(name, params, args) \
+    static void host_##name params { \
+        ensure_host_gl(); \
+        if (p_host_##name) \
+            p_host_##name args; \
+    }
+CGL_HOST_GL_CALL_VOID(glFlush, (void), ())
+CGL_HOST_GL_CALL_VOID(glFinish, (void), ())
+CGL_HOST_GL_CALL(GLsync, glFenceSync, (GLenum condition, GLbitfield flags), (condition, flags))
+CGL_HOST_GL_CALL_VOID(glDeleteTextures, (GLsizei n, const GLuint *textures), (n, textures))
+CGL_HOST_GL_CALL_VOID(glTexImage2D, (GLenum target, GLint level, GLint internalFormat, GLsizei width,
+                                     GLsizei height, GLint border, GLenum format, GLenum type,
+                                     const GLvoid *pixels),
+                      (target, level, internalFormat, width, height, border, format, type, pixels))
+CGL_HOST_GL_CALL_VOID(glBindFramebuffer, (GLenum target, GLuint framebuffer), (target, framebuffer))
+CGL_HOST_GL_CALL_VOID(glBindFramebufferEXT, (GLenum target, GLuint framebuffer), (target, framebuffer))
+CGL_HOST_GL_CALL_VOID(glDeleteFramebuffers, (GLsizei n, const GLuint *framebuffers), (n, framebuffers))
+CGL_HOST_GL_CALL_VOID(glDeleteFramebuffersEXT, (GLsizei n, const GLuint *framebuffers), (n, framebuffers))
+CGL_HOST_GL_CALL_VOID(glGetFramebufferAttachmentParameteriv,
+                      (GLenum target, GLenum attachment, GLenum pname, GLint *params),
+                      (target, attachment, pname, params))
+#undef CGL_HOST_GL_CALL
+#undef CGL_HOST_GL_CALL_VOID
 
 // IOSurface-backed textures.
 //
@@ -1998,14 +2381,16 @@ void glSwapAPPLE(void) {
 // plane's pixels are copied into the texture by the call, and
 // CGLReadbackIOSurface copies the texture back into the surface. CPU writes
 // to the surface after the call reach the texture only through another
-// call. GL rendering into the texture reaches the surface through
+// call. GL rendering into the texture reaches the surface when the context
+// flushes it, before the texture is deleted or given other contents (see
+// "Writing GL rendering back into surfaces"), and through
 // CGLReadbackIOSurface, which IOSurface also calls before a lock of the
 // surface or the creation of a Mach port for it (see writeBackSurface).
 //
 // Each texture remembers the surface it was last specified from. The binding
 // retains the surface, as the texture would on macOS, and is dropped when
-// the same texture is specified from another surface or when the context is
-// destroyed.
+// the same texture is specified from another surface, when the texture is
+// deleted, or when the context is destroyed.
 
 struct surface_binding {
     CGLContextObj context;
@@ -2030,18 +2415,76 @@ struct surface_binding {
     // the same plane in the same format and size share a shadow.
     GLuint shadow;
     uint32_t shadowFormat;
+    // The texture may have been rendered into since it was last written
+    // back (one that holds a copy) or since the binding was made (one that
+    // uses the surface's memory), and when that was last noted (a value of
+    // g_renderSerial; 0 if never).
+    int dirty;
+    uint64_t rendered;
+    // A texture that uses the surface's memory has been rendered into since
+    // a context that shares it last flushed.
+    int unflushed;
+    // The texture (imported) or its shadow uses the surface's GPU buffer
+    // instead of its memory (see "GPU buffers"), or giving the surface one
+    // failed and is not tried again for this binding.
+    int gpuBuffer;
+    int noGPUBuffer;
 };
 
 static struct surface_binding *g_surfaceBindings;
 static size_t g_surfaceBindingCount, g_surfaceBindingCapacity;
 static pthread_mutex_t g_surfaceBindingsMutex = PTHREAD_MUTEX_INITIALIZER;
+// The number of bindings, read without the lock so that GL calls skip the
+// writeback work when there are none.
+static _Atomic size_t g_bindingCount;
+// Orders the notes of rendering. Guarded by g_surfaceBindingsMutex.
+static uint64_t g_renderSerial;
+
+// The share group number is the identity of the group (a number is never
+// reused, so it stays distinct from the groups of later contexts); the
+// group object an application sees is that number.
+CGLShareGroupObj CGLGetShareGroup(CGLContextObj ctx) {
+    return ctx ? (CGLShareGroupObj)(uintptr_t) ctx->share_group : NULL;
+}
+
+// Whether the two contexts share textures.
+static int sharesTextures(CGLContextObj a, CGLContextObj b) {
+    return a == b || a->share_group == b->share_group;
+}
+
+// Rendering into the surface's memory or GPU buffer that no flush has
+// reported yet changed the contents all the same. Called with the bindings
+// locked.
+static void reportUnflushedBinding(const struct surface_binding *binding) {
+    if (!binding->unflushed)
+        return;
+    // The rendering has to be complete before it is reported (IOSurface
+    // copies a buffer into the memory, and a reader of the memory has no
+    // other way to wait for it); it can only be waited for where the
+    // context is current.
+    CGLContextObj current = CGLGetCurrentContext();
+    if (current != NULL && sharesTextures(current, binding->context)
+        && (binding->gpuBuffer || _IOSurfaceIsShared(binding->surface)))
+        host_glFinish();
+    if (binding->gpuBuffer)
+        _IOSurfaceGPUDidWriteBuffer(binding->surface);
+    else
+        _IOSurfaceGPUDidWriteMemory(binding->surface);
+}
+
+// Removes the binding at index i. Called with the bindings locked.
+static void removeSurfaceBinding(size_t i) {
+    atomic_fetch_sub(&g_bindingCount, 1);
+    reportUnflushedBinding(&g_surfaceBindings[i]);
+    CFRelease(g_surfaceBindings[i].surface);
+    g_surfaceBindings[i] = g_surfaceBindings[--g_surfaceBindingCount];
+}
 
 static void forgetSurfaceBindings(CGLContextObj context) {
     pthread_mutex_lock(&g_surfaceBindingsMutex);
     for (size_t i = 0; i < g_surfaceBindingCount; ) {
         if (g_surfaceBindings[i].context == context) {
-            CFRelease(g_surfaceBindings[i].surface);
-            g_surfaceBindings[i] = g_surfaceBindings[--g_surfaceBindingCount];
+            removeSurfaceBinding(i);
         } else {
             i++;
         }
@@ -2109,15 +2552,17 @@ static int rememberSurfaceBinding(const struct surface_binding *binding) {
             GLuint shadow = g_surfaceBindings[i].shadow;
             if (shadow != 0 && shadow != binding->shadow && !shadowInUse(binding->context, shadow, i))
                 unusedShadow = shadow;
+            reportUnflushedBinding(&g_surfaceBindings[i]);
             CFRelease(g_surfaceBindings[i].surface);
         } else {
             g_surfaceBindingCount++;
+            atomic_fetch_add(&g_bindingCount, 1);
         }
         g_surfaceBindings[i] = *binding;
     }
     pthread_mutex_unlock(&g_surfaceBindingsMutex);
     if (unusedShadow != 0)
-        glDeleteTextures(1, &unusedShadow);
+        host_glDeleteTextures(1, &unusedShadow);
     return ok;
 }
 
@@ -2237,6 +2682,11 @@ static PFNEGLDESTROYIMAGEKHRPROC p_eglDestroyImageKHR;
 // do not declare.
 typedef void (*cgl_image_target_texture_proc)(GLenum target, void *image);
 static cgl_image_target_texture_proc p_glEGLImageTargetTexture2DOES;
+// eglQueryDmaBufModifiersEXT (EGL_EXT_image_dma_buf_import_modifiers).
+typedef EGLBoolean (*cgl_query_modifiers_proc)(EGLDisplay display, EGLint format, EGLint maxModifiers,
+                                               uint64_t *modifiers, EGLBoolean *externalOnly,
+                                               EGLint *modifierCount);
+static cgl_query_modifiers_proc p_eglQueryDmaBufModifiersEXT;
 
 // GPU copies between textures. Looked up rather than linked, as the host GL
 // library need not export them.
@@ -2260,6 +2710,8 @@ static void load_image_functions(void) {
     p_eglDestroyImageKHR = (PFNEGLDESTROYIMAGEKHRPROC) p_eglGetProcAddress("eglDestroyImageKHR");
     p_glEGLImageTargetTexture2DOES =
         (cgl_image_target_texture_proc) p_eglGetProcAddress("glEGLImageTargetTexture2DOES");
+    p_eglQueryDmaBufModifiersEXT =
+        (cgl_query_modifiers_proc) p_eglGetProcAddress("eglQueryDmaBufModifiersEXT");
 }
 
 static int has_extension(const char *extensions, const char *name) {
@@ -2530,7 +2982,7 @@ static struct cgl_profile_strings *currentProfileStrings(void) {
     return strings;
 }
 
-CGL_EXPORT const GLubyte *glGetString(GLenum name) {
+const GLubyte *override_glGetString(GLenum name) {
     if (name == GL_VERSION || name == GL_SHADING_LANGUAGE_VERSION || name == GL_EXTENSIONS) {
         struct cgl_profile_strings *strings = currentProfileStrings();
         if (strings) {
@@ -2546,7 +2998,7 @@ CGL_EXPORT const GLubyte *glGetString(GLenum name) {
     return host_glGetString(name);
 }
 
-CGL_EXPORT const GLubyte *glGetStringi(GLenum name, GLuint index) {
+const GLubyte *override_glGetStringi(GLenum name, GLuint index) {
     if (name == GL_EXTENSIONS) {
         struct cgl_profile_strings *strings = currentProfileStrings();
         if (strings && strings->core)
@@ -2559,7 +3011,7 @@ CGL_EXPORT const GLubyte *glGetStringi(GLenum name, GLuint index) {
     return host_glGetStringi(name, index);
 }
 
-CGL_EXPORT void glGetIntegerv(GLenum pname, GLint *params) {
+void override_glGetIntegerv(GLenum pname, GLint *params) {
     if (pname == GL_MAJOR_VERSION || pname == GL_MINOR_VERSION || pname == GL_NUM_EXTENSIONS) {
         struct cgl_profile_strings *strings = currentProfileStrings();
         if (strings && strings->core) {
@@ -2649,15 +3101,119 @@ static uint32_t drmFormat(GLenum internal_format, GLenum format, GLenum type) {
     }
 }
 
+// Whether the display can use an image of the plane memory's linear layout
+// (a pitch-linear dma-buf, which is what IOSurface exports) as a 2D texture
+// of DRM format fourcc that GL can sample, copy from and render into. Some
+// drivers import such images but accept them only as external-only
+// textures: binding one to GL_TEXTURE_2D fails, and importing one with a
+// plane offset or through another route can crash the driver. The
+// modifiers the display lists for the format say which case it is, so
+// nothing needs to be tried. Answers are kept per display and format. With
+// no modifier listing to ask, the import is left to be tried.
+struct linear_import_answer {
+    EGLDisplay display;
+    uint32_t fourcc;
+    int usable;
+};
+#define LINEAR_IMPORT_ANSWERS 32
+static struct linear_import_answer g_linearImportAnswers[LINEAR_IMPORT_ANSWERS];
+static size_t g_linearImportAnswerCount;
+static pthread_mutex_t g_linearImportMutex = PTHREAD_MUTEX_INITIALIZER;
+
+static int queryLinearImportUsable(EGLDisplay display, uint32_t fourcc) {
+    if (!p_eglQueryDmaBufModifiersEXT)
+        return 1;
+    EGLint count = 0;
+    if (!p_eglQueryDmaBufModifiersEXT(display, (EGLint) fourcc, 0, NULL, NULL, &count))
+        return 1;
+    if (count <= 0)
+        return 1;
+    uint64_t *modifiers = malloc((size_t) count * sizeof(*modifiers));
+    EGLBoolean *externalOnly = malloc((size_t) count * sizeof(*externalOnly));
+    int usable = 1;
+    if (modifiers && externalOnly) {
+        EGLint returned = 0;
+        if (p_eglQueryDmaBufModifiersEXT(display, (EGLint) fourcc, count, modifiers, externalOnly, &returned)) {
+            usable = 0;
+            for (EGLint i = 0; i < returned; i++) {
+                if (modifiers[i] == CGL_DRM_FORMAT_MOD_LINEAR && !externalOnly[i])
+                    usable = 1;
+            }
+        }
+    }
+    free(modifiers);
+    free(externalOnly);
+    return usable;
+}
+
+static int linearImportUsable(CGLContextObj context, uint32_t fourcc) {
+    EGLDisplay display = context->egl_display;
+    pthread_mutex_lock(&g_linearImportMutex);
+    for (size_t i = 0; i < g_linearImportAnswerCount; i++) {
+        if (g_linearImportAnswers[i].display == display && g_linearImportAnswers[i].fourcc == fourcc) {
+            int usable = g_linearImportAnswers[i].usable;
+            pthread_mutex_unlock(&g_linearImportMutex);
+            return usable;
+        }
+    }
+    pthread_mutex_unlock(&g_linearImportMutex);
+
+    int usable = queryLinearImportUsable(display, fourcc);
+    pthread_mutex_lock(&g_linearImportMutex);
+    if (g_linearImportAnswerCount < LINEAR_IMPORT_ANSWERS)
+        g_linearImportAnswers[g_linearImportAnswerCount++] =
+            (struct linear_import_answer) { display, fourcc, usable };
+    pthread_mutex_unlock(&g_linearImportMutex);
+    return usable;
+}
+
+// GL errors that were pending when an import attempt began. The attempt
+// may fail in the driver and raise errors of its own, which belong to no
+// application call; they are cleared afterwards and the earlier ones are
+// raised again, so that glGetError shows the application exactly its own.
+// Only the error codes that a harmless call can raise again are kept
+// (the others are rare enough that dropping them is the lesser harm).
+struct gl_errors {
+    unsigned enumError : 1, valueError : 1, operationError : 1;
+};
+
+static void saveGLErrors(struct gl_errors *saved) {
+    memset(saved, 0, sizeof(*saved));
+    // Each code has its own flag, so one call returns at most one per code.
+    for (int i = 0; i < 16; i++) {
+        GLenum error = glGetError();
+        if (error == GL_NO_ERROR)
+            break;
+        if (error == GL_INVALID_ENUM)
+            saved->enumError = 1;
+        else if (error == GL_INVALID_VALUE)
+            saved->valueError = 1;
+        else if (error == GL_INVALID_OPERATION)
+            saved->operationError = 1;
+    }
+}
+
+static void restoreGLErrors(const struct gl_errors *saved) {
+    for (int i = 0; i < 16 && glGetError() != GL_NO_ERROR; i++)
+        ;
+    // None of these calls changes state when it fails. An invalid uniform
+    // location other than -1 is an error with or without a current program.
+    if (saved->enumError)
+        glDisable(0xffff);
+    if (saved->valueError)
+        glGenTextures(-1, NULL);
+    if (saved->operationError)
+        glUniform1i(-2, 0);
+}
+
 // Makes an EGL image of width x height pixels of the plane's memory in DRM
 // format fourcc, or returns EGL_NO_IMAGE_KHR.
 static EGLImageKHR createPlaneImage(CGLContextObj context, uint32_t fourcc, GLsizei width, GLsizei height,
                                    IOSurfaceRef surface, GLuint plane) {
     enum dmabuf_import support = dmabuf_import(context);
     if (support == DMABUF_IMPORT_UNSUPPORTED)
-        return 0;
-
-    if (support == DMABUF_IMPORT_UNSUPPORTED)
+        return EGL_NO_IMAGE_KHR;
+    if (!linearImportUsable(context, fourcc))
         return EGL_NO_IMAGE_KHR;
 
     _IOSurfaceDMABuf buffer = { .version = _IOSURFACE_DMABUF_VERSION };
@@ -2685,6 +3241,67 @@ static EGLImageKHR createPlaneImage(CGLContextObj context, uint32_t fourcc, GLsi
     return p_eglCreateImageKHR(context->egl_display, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, NULL, attributes);
 }
 
+#define CGL_MAX_NOTED_ATTACHMENTS 16
+
+// Attaches the texture again where the current context's draw or read
+// framebuffer has it as a color attachment, after its storage has been
+// replaced with an EGLImage or taken away from one. The framebuffer refers
+// to the texture object, so rendering should reach the new storage anyway,
+// but a host driver was seen to keep rendering into the old one until the
+// texture was attached again.
+static void reattachTexture(CGLContextObj context, GLenum target, GLuint texture) {
+    static const GLenum framebufferTargets[2] = { GL_DRAW_FRAMEBUFFER, GL_READ_FRAMEBUFFER };
+    static const GLenum bindings[2] = { GL_DRAW_FRAMEBUFFER_BINDING, GL_READ_FRAMEBUFFER_BINDING };
+    GLint framebuffers[2] = { 0, 0 };
+    glGetIntegerv(bindings[0], &framebuffers[0]);
+    glGetIntegerv(bindings[1], &framebuffers[1]);
+    if (context->max_color_attachments == 0) {
+        GLint max = 0;
+        glGetIntegerv(GL_MAX_COLOR_ATTACHMENTS, &max);
+        context->max_color_attachments = max < 1 ? 1 : max > CGL_MAX_NOTED_ATTACHMENTS ? CGL_MAX_NOTED_ATTACHMENTS : max;
+    }
+    for (int f = 0; f < 2; f++) {
+        if (framebuffers[f] == 0 || (f == 1 && framebuffers[1] == framebuffers[0]))
+            continue;
+        for (GLint i = 0; i < context->max_color_attachments; i++) {
+            GLint type = GL_NONE, name = 0, level = 0;
+            host_glGetFramebufferAttachmentParameteriv(framebufferTargets[f], GL_COLOR_ATTACHMENT0 + i,
+                                                       GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, &type);
+            if (type != GL_TEXTURE)
+                continue;
+            host_glGetFramebufferAttachmentParameteriv(framebufferTargets[f], GL_COLOR_ATTACHMENT0 + i,
+                                                       GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &name);
+            if ((GLuint) name != texture)
+                continue;
+            host_glGetFramebufferAttachmentParameteriv(framebufferTargets[f], GL_COLOR_ATTACHMENT0 + i,
+                                                       GL_FRAMEBUFFER_ATTACHMENT_TEXTURE_LEVEL, &level);
+            glFramebufferTexture2D(framebufferTargets[f], GL_COLOR_ATTACHMENT0 + i, target, texture, level);
+        }
+    }
+}
+
+// Makes the 2D texture bound in the current context use image, which it
+// destroys. Returns whether the driver took it; if not, the texture may
+// have been emptied.
+static int importImage(CGLContextObj context, GLenum target, GLenum internal_format,
+                       GLsizei width, GLsizei height, GLenum format, GLenum type, EGLImageKHR image) {
+    // The texture has the image's size afterwards only if the driver took
+    // the image; it is emptied first so that its old size does not count.
+    // Errors of the attempt are not the application's.
+    struct gl_errors saved;
+    saveGLErrors(&saved);
+    host_glTexImage2D(target, 0, (GLint) internal_format, 0, 0, 0, format, type, NULL);
+    p_glEGLImageTargetTexture2DOES(target, image);
+    // The texture keeps the memory after the image is gone.
+    p_eglDestroyImageKHR(context->egl_display, image);
+
+    GLint importedWidth = 0, importedHeight = 0;
+    glGetTexLevelParameteriv(target, 0, GL_TEXTURE_WIDTH, &importedWidth);
+    glGetTexLevelParameteriv(target, 0, GL_TEXTURE_HEIGHT, &importedHeight);
+    restoreGLErrors(&saved);
+    return importedWidth == width && importedHeight == height;
+}
+
 // Makes the texture bound to target in the current context use the plane's
 // memory. Returns 0, leaving the texture as it was, if the context, the
 // surface, the target or the format do not allow that.
@@ -2700,31 +3317,50 @@ static int importSurfacePlane(CGLContextObj context, GLenum target, GLenum inter
     EGLImageKHR image = createPlaneImage(context, fourcc, width, height, surface, plane);
     if (image == EGL_NO_IMAGE_KHR)
         return 0;
-    // The texture has the image's size afterwards only if the driver took
-    // the image; it is emptied first so that its old size does not count.
-    // Checking it so leaves the GL error state to the application.
-    glTexImage2D(target, 0, (GLint) internal_format, 0, 0, 0, format, type, NULL);
-    p_glEGLImageTargetTexture2DOES(target, image);
-    // The texture keeps the memory after the image is gone.
-    p_eglDestroyImageKHR(context->egl_display, image);
-
-    GLint importedWidth = 0, importedHeight = 0;
-    glGetTexLevelParameteriv(target, 0, GL_TEXTURE_WIDTH, &importedWidth);
-    glGetTexLevelParameteriv(target, 0, GL_TEXTURE_HEIGHT, &importedHeight);
-    return importedWidth == width && importedHeight == height;
+    return importImage(context, target, internal_format, width, height, format, type, image);
 }
 
-// Makes context current on this thread for the duration of a call.
-static CGLError enterContext(CGLContextObj context, CGLContextObj *previous) {
-    *previous = CGLGetCurrentContext();
-    if (*previous == context)
+// Makes context current on this thread for the duration of a call, with the
+// thread holding its host binding: the framework's own calls into the host
+// driver (the ones that do not go through the gl* exports) need it, and a
+// context that is current here may have been parked, or given up after the
+// last call (see gl_acquire_binding).
+struct context_scope {
+    CGLContextObj previous;
+    // The binding was taken for this scope only (see gl_acquire_binding).
+    int transient;
+};
+
+//
+// A thread that has no current context or another one is given the context by
+// making it current (waiting for its holder, see setCurrentContext). A thread
+// whose current context it is only gets the binding back; may_wait is 0 where
+// that is not the thread's own request (the callbacks of IOSurface, which run
+// on whatever thread locks a surface, and the refresh when a context is made
+// current or locked): it must not wait for another thread's binding, and the
+// work is left undone when it cannot have it.
+static CGLError enterContext(CGLContextObj context, struct context_scope *scope, int may_wait) {
+    scope->previous = CGLGetCurrentContext();
+    scope->transient = 0;
+    if (scope->previous != context)
+        return setCurrentContext(context);
+    if (GL_BOUND_HERE())
         return kCGLNoError;
-    return setCurrentContext(context);
+    int acquired = acquireBinding(may_wait);
+    if (acquired == 0)
+        return kCGLBadContext;
+    scope->transient = acquired == 2;
+    return kCGLNoError;
 }
 
-static void leaveContext(CGLContextObj context, CGLContextObj previous) {
-    if (previous != context)
-        setCurrentContext(previous);
+static void leaveContext(CGLContextObj context, const struct context_scope *scope) {
+    if (scope->previous != context) {
+        // The thread's own context stays lazily current if it was.
+        if (scope->previous == NULL || !setCurrentContextLazily(scope->previous))
+            setCurrentContext(scope->previous);
+    } else if (scope->transient) {
+        gl_release_transient();
+    }
 }
 
 // Rectangle textures kept in step with a surface through a shadow.
@@ -2817,10 +3453,16 @@ static enum gpu_copy gpu_copy(CGLContextObj context) {
 
 // Copies width x height texels of level 0 from one texture to another in
 // the current context, on the GPU. The textures have formats of the same
-// size. Returns 0 if the context has no way to do it.
-static int gpuCopy(CGLContextObj context, GLuint source, GLenum sourceTarget,
-                   GLuint destination, GLenum destinationTarget, GLsizei width, GLsizei height) {
-    switch (gpu_copy(context)) {
+// size. With convert, the copy goes by colour components rather than by
+// bits (a blit), for textures whose formats order the components
+// differently, as a GPU buffer may to the driver. Returns 0 if the context
+// has no way to do it.
+static int gpuCopy(CGLContextObj context, GLuint source, GLenum sourceTarget, GLuint destination,
+                             GLenum destinationTarget, GLsizei width, GLsizei height, int convert) {
+    enum gpu_copy method = gpu_copy(context);
+    if (convert && method != GPU_COPY_NONE)
+        method = p_glBlitFramebuffer ? GPU_COPY_BLIT : GPU_COPY_NONE;
+    switch (method) {
     case GPU_COPY_IMAGE:
         p_glCopyImageSubData(source, sourceTarget, 0, 0, 0, 0, destination, destinationTarget, 0, 0, 0, 0,
                              width, height, 1);
@@ -2844,17 +3486,17 @@ static int gpuCopy(CGLContextObj context, GLuint source, GLenum sourceTarget,
     glDisable(GL_SCISSOR_TEST);
     if (srgb)
         glDisable(GL_FRAMEBUFFER_SRGB);
-    glBindFramebuffer(GL_READ_FRAMEBUFFER, context->copy_framebuffers[0]);
+    host_glBindFramebuffer(GL_READ_FRAMEBUFFER, context->copy_framebuffers[0]);
     glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, sourceTarget, source, 0);
-    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, context->copy_framebuffers[1]);
+    host_glBindFramebuffer(GL_DRAW_FRAMEBUFFER, context->copy_framebuffers[1]);
     glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, destinationTarget, destination, 0);
     p_glBlitFramebuffer(0, 0, width, height, 0, 0, width, height, GL_COLOR_BUFFER_BIT, GL_NEAREST);
     // Detached again, so that the framebuffers keep no texture alive.
     glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, sourceTarget, 0, 0);
     glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, destinationTarget, 0, 0);
 
-    glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint) readFramebuffer);
-    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint) drawFramebuffer);
+    host_glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint) readFramebuffer);
+    host_glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint) drawFramebuffer);
     if (scissor)
         glEnable(GL_SCISSOR_TEST);
     if (srgb)
@@ -2862,27 +3504,195 @@ static int gpuCopy(CGLContextObj context, GLuint source, GLenum sourceTarget,
     return 1;
 }
 
+// GPU buffers.
+//
+// Some drivers can sample a DMA-BUF in the linear layout of a surface's
+// memory but not render into it (it is external only to them; see
+// linearImportUsable). Where such a driver renders into a surface, the
+// surface gets a GPU buffer in a layout the driver renders into, from
+// IOSurface (_IOSurfaceGetGPUBuffer in IOSurfacePriv.h), which keeps it in
+// step with the memory. That happens the first time rendering into a
+// texture specified from the surface is written back (copyBindingToSurface):
+// the texture's rendering is copied into the new buffer on the GPU, and the
+// texture itself is made to use the buffer, a 2D texture by import and a
+// rectangle texture through a shadow imported from it. Later textures
+// specified from the surface in this process use the buffer the same way.
+// Completed rendering into the buffer is reported at the same points as
+// rendering into imported memory, after the context has finished it, and
+// IOSurface then copies it into the memory. Drivers that render into the
+// linear layout never get here: their textures use the memory itself.
+//
+// DMA-BUFs (the surface's memory or its GPU buffer) are only ever given to
+// the driver through EGL_EXT_image_dma_buf_import, always at offset 0 for
+// GPU buffers, and never through glImportMemoryFdEXT: some drivers take
+// only their own memory objects there and crash on a DMA-BUF.
+
+// EGL_EXT_device_query and EGL_EXT_device_drm_render_node.
+#define CGL_EGL_DEVICE_EXT 0x322C
+#define CGL_EGL_DRM_RENDER_NODE_FILE_EXT 0x3377
+#define CGL_MAX_MODIFIERS 64
+
+struct render_node_answer {
+    EGLDisplay display;
+    char path[64];
+};
+#define RENDER_NODE_ANSWERS 8
+static struct render_node_answer g_renderNodeAnswers[RENDER_NODE_ANSWERS];
+static size_t g_renderNodeAnswerCount;
+static pthread_mutex_t g_renderNodeMutex = PTHREAD_MUTEX_INITIALIZER;
+
+static void queryRenderNode(EGLDisplay display, char *path, size_t size) {
+    path[0] = '\0';
+    const char *client = p_eglQueryString(EGL_NO_DISPLAY, EGL_EXTENSIONS);
+    if (!client || !has_extension(client, "EGL_EXT_device_query"))
+        return;
+    typedef EGLBoolean (*query_display_attrib_proc)(EGLDisplay display, EGLint attribute, EGLAttrib *value);
+    typedef const char *(*query_device_string_proc)(void *device, EGLint name);
+    query_display_attrib_proc queryDisplayAttrib =
+        (query_display_attrib_proc) p_eglGetProcAddress("eglQueryDisplayAttribEXT");
+    query_device_string_proc queryDeviceString =
+        (query_device_string_proc) p_eglGetProcAddress("eglQueryDeviceStringEXT");
+    EGLAttrib device = 0;
+    if (!queryDisplayAttrib || !queryDeviceString || !queryDisplayAttrib(display, CGL_EGL_DEVICE_EXT, &device)
+        || !device)
+        return;
+    const char *extensions = queryDeviceString((void *) device, EGL_EXTENSIONS);
+    if (!extensions || !has_extension(extensions, "EGL_EXT_device_drm_render_node"))
+        return;
+    const char *node = queryDeviceString((void *) device, CGL_EGL_DRM_RENDER_NODE_FILE_EXT);
+    if (node && strlen(node) < size)
+        strcpy(path, node);
+}
+
+// The host path of the DRM render node of the context's display, or NULL.
+// Answers are kept per display.
+static const char *renderNode(CGLContextObj context) {
+    EGLDisplay display = context->egl_display;
+    const char *path = NULL;
+    pthread_mutex_lock(&g_renderNodeMutex);
+    for (size_t i = 0; i < g_renderNodeAnswerCount && path == NULL; i++) {
+        if (g_renderNodeAnswers[i].display == display)
+            path = g_renderNodeAnswers[i].path;
+    }
+    if (path == NULL && g_renderNodeAnswerCount < RENDER_NODE_ANSWERS) {
+        struct render_node_answer *answer = &g_renderNodeAnswers[g_renderNodeAnswerCount++];
+        answer->display = display;
+        queryRenderNode(display, answer->path, sizeof(answer->path));
+        path = answer->path;
+    }
+    pthread_mutex_unlock(&g_renderNodeMutex);
+    return path && path[0] ? path : NULL;
+}
+
+// The layout modifiers that the display lists for fourcc as usable for
+// rendering, the linear layout left out. Returns how many there are.
+static size_t renderModifiers(EGLDisplay display, uint32_t fourcc, uint64_t *modifiers, size_t max) {
+    if (!p_eglQueryDmaBufModifiersEXT)
+        return 0;
+    uint64_t listed[CGL_MAX_MODIFIERS];
+    EGLBoolean externalOnly[CGL_MAX_MODIFIERS];
+    EGLint count = 0;
+    if (!p_eglQueryDmaBufModifiersEXT(display, (EGLint) fourcc, CGL_MAX_MODIFIERS, listed, externalOnly, &count))
+        return 0;
+    size_t usable = 0;
+    for (EGLint i = 0; i < count && i < CGL_MAX_MODIFIERS && usable < max; i++) {
+        if (!externalOnly[i] && listed[i] != CGL_DRM_FORMAT_MOD_LINEAR)
+            modifiers[usable++] = listed[i];
+    }
+    return usable;
+}
+
+// Whether the current context renders into surfaces of DRM format fourcc
+// through GPU buffers: its driver cannot render into the linear layout, can
+// import other layouts, and can copy between textures on the GPU.
+static int gpuBufferUsable(CGLContextObj context, uint32_t fourcc) {
+    if (fourcc != CGL_DRM_FORMAT_ARGB8888 && fourcc != CGL_DRM_FORMAT_ABGR8888)
+        return 0;
+    if (dmabuf_import(context) != DMABUF_IMPORT_WITH_MODIFIERS || linearImportUsable(context, fourcc))
+        return 0;
+    // Copies to and from the buffer are blits (gpuCopy with convert).
+    return gpu_copy(context) != GPU_COPY_NONE && p_glBlitFramebuffer != NULL;
+}
+
+// Fills in *buffer with the GPU buffer of the plane, made if create is set
+// and the surface has none. Returns 0 if the context does not use GPU
+// buffers for the format, or the surface has or can get no buffer of the
+// given size that the context can render into.
+static int getGPUBuffer(CGLContextObj context, IOSurfaceRef surface, GLuint plane, uint32_t fourcc,
+                        GLsizei width, GLsizei height, int create, _IOSurfaceGPUBuffer *buffer) {
+    if (!gpuBufferUsable(context, fourcc))
+        return 0;
+    const char *node = renderNode(context);
+    if (node == NULL)
+        return 0;
+    uint64_t modifiers[CGL_MAX_MODIFIERS];
+    size_t count = renderModifiers(context->egl_display, fourcc, modifiers, CGL_MAX_MODIFIERS);
+    if (count == 0)
+        return 0;
+    *buffer = (_IOSurfaceGPUBuffer) { .version = _IOSURFACE_GPU_BUFFER_VERSION };
+    if (!_IOSurfaceGetGPUBuffer(surface, plane, node, fourcc, modifiers, count,
+                                create ? _IOSURFACE_GPU_BUFFER_CREATE : 0, buffer))
+        return 0;
+    if (buffer->width != (uint32_t) width || buffer->height != (uint32_t) height || buffer->offset != 0
+        || buffer->stride > INT32_MAX)
+        return 0;
+    for (size_t i = 0; i < count; i++) {
+        if (modifiers[i] == buffer->modifier)
+            return 1;
+    }
+    return 0;
+}
+
+static EGLImageKHR createGPUBufferImage(CGLContextObj context, const _IOSurfaceGPUBuffer *buffer) {
+    EGLint attributes[] = {
+        EGL_WIDTH, (EGLint) buffer->width,
+        EGL_HEIGHT, (EGLint) buffer->height,
+        EGL_LINUX_DRM_FOURCC_EXT, (EGLint) buffer->fourcc,
+        EGL_DMA_BUF_PLANE0_FD_EXT, buffer->fd,
+        EGL_DMA_BUF_PLANE0_OFFSET_EXT, 0,
+        EGL_DMA_BUF_PLANE0_PITCH_EXT, (EGLint) buffer->stride,
+        EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT, (EGLint) (buffer->modifier & 0xffffffff),
+        EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT, (EGLint) (buffer->modifier >> 32),
+        EGL_NONE,
+    };
+    return p_eglCreateImageKHR(context->egl_display, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, NULL, attributes);
+}
+
+// Makes the 2D texture bound in the current context use the GPU buffer.
+static int importGPUBuffer(CGLContextObj context, GLenum internal_format, GLsizei width, GLsizei height,
+                           GLenum format, GLenum type, const _IOSurfaceGPUBuffer *buffer) {
+    EGLImageKHR image = createGPUBufferImage(context, buffer);
+    if (image == EGL_NO_IMAGE_KHR)
+        return 0;
+    return importImage(context, GL_TEXTURE_2D, internal_format, width, height, format, type, image);
+}
+
 // The shadow for a rectangle texture of the plane: a binding's shadow of
 // the same plane, format and size in the context, or a new 2D texture
-// imported from the plane. Returns 0 if there is none.
+// imported from the plane's memory, or from its GPU buffer if buffer is not
+// NULL. Returns 0 if there is none.
 static GLuint shadowTexture(CGLContextObj context, IOSurfaceRef surface, GLuint plane, uint32_t fourcc,
-                            GLsizei width, GLsizei height) {
+                            GLsizei width, GLsizei height, const _IOSurfaceGPUBuffer *buffer) {
     GLuint shadow = 0;
     pthread_mutex_lock(&g_surfaceBindingsMutex);
     for (size_t i = 0; i < g_surfaceBindingCount && shadow == 0; i++) {
         const struct surface_binding *binding = &g_surfaceBindings[i];
         if (binding->context == context && binding->shadow != 0 && binding->surface == surface
             && binding->plane == plane && binding->shadowFormat == fourcc
-            && binding->width == width && binding->height == height)
+            && binding->width == width && binding->height == height
+            && binding->gpuBuffer == (buffer != NULL))
             shadow = binding->shadow;
     }
     pthread_mutex_unlock(&g_surfaceBindingsMutex);
     if (shadow != 0)
         return shadow;
 
-    EGLImageKHR image = createPlaneImage(context, fourcc, width, height, surface, plane);
+    EGLImageKHR image = buffer ? createGPUBufferImage(context, buffer)
+                               : createPlaneImage(context, fourcc, width, height, surface, plane);
     if (image == EGL_NO_IMAGE_KHR)
         return 0;
+    struct gl_errors saved;
+    saveGLErrors(&saved);
     GLint previous = 0;
     glGetIntegerv(GL_TEXTURE_BINDING_2D, &previous);
     glGenTextures(1, &shadow);
@@ -2897,9 +3707,10 @@ static GLuint shadowTexture(CGLContextObj context, IOSurfaceRef surface, GLuint 
     glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &importedHeight);
     glBindTexture(GL_TEXTURE_2D, (GLuint) previous);
     if (importedWidth != width || importedHeight != height) {
-        glDeleteTextures(1, &shadow);
-        return 0;
+        host_glDeleteTextures(1, &shadow);
+        shadow = 0;
     }
+    restoreGLErrors(&saved);
     return shadow;
 }
 
@@ -2909,7 +3720,8 @@ static GLuint shadowTexture(CGLContextObj context, IOSurfaceRef surface, GLuint 
 static GLuint copySurfacePlaneToRectangle(CGLContextObj context, GLenum target, GLint texture,
                                           GLenum internal_format, GLsizei width, GLsizei height,
                                           GLenum format, GLenum type, IOSurfaceRef surface,
-                                          GLuint plane, uint32_t *shadowFormat) {
+                                          GLuint plane, const _IOSurfaceGPUBuffer *buffer,
+                                          uint32_t *shadowFormat) {
     if (target != GL_TEXTURE_RECTANGLE || texture == 0)
         return 0;
     // Formats without alpha are left out: the copy would carry the
@@ -2921,7 +3733,7 @@ static GLuint copySurfacePlaneToRectangle(CGLContextObj context, GLenum target, 
         return 0;
     if (dmabuf_import(context) == DMABUF_IMPORT_UNSUPPORTED || gpu_copy(context) == GPU_COPY_NONE)
         return 0;
-    GLuint shadow = shadowTexture(context, surface, plane, fourcc, width, height);
+    GLuint shadow = shadowTexture(context, surface, plane, fourcc, width, height, buffer);
     if (shadow == 0)
         return 0;
 
@@ -2933,10 +3745,10 @@ static GLuint copySurfacePlaneToRectangle(CGLContextObj context, GLenum target, 
         struct pixel_store saved, none = { 0, 0, 0, 0, 4 };
         savePixelStore(0, &saved);
         setPixelStore(0, &none);
-        glTexImage2D(target, 0, (GLint) internal_format, width, height, 0, format, type, NULL);
+        host_glTexImage2D(target, 0, (GLint) internal_format, width, height, 0, format, type, NULL);
         setPixelStore(0, &saved);
     }
-    gpuCopy(context, shadow, GL_TEXTURE_2D, (GLuint) texture, target, width, height);
+    gpuCopy(context, shadow, GL_TEXTURE_2D, (GLuint) texture, target, width, height, buffer != NULL);
     *shadowFormat = fourcc;
     return shadow;
 }
@@ -2964,7 +3776,7 @@ static void refreshRectangleTextures(CGLContextObj context) {
         pthread_mutex_lock(&g_surfaceBindingsMutex);
         for (size_t i = 0; i < g_surfaceBindingCount; i++) {
             struct surface_binding *candidate = &g_surfaceBindings[i];
-            if (candidate->context != context || candidate->shadow == 0)
+            if (candidate->context != context || (candidate->shadow == 0 && !candidate->gpuBuffer))
                 continue;
             seed = IOSurfaceGetSeed(candidate->surface);
             if (seed != candidate->seed) {
@@ -2976,11 +3788,23 @@ static void refreshRectangleTextures(CGLContextObj context) {
         pthread_mutex_unlock(&g_surfaceBindingsMutex);
         if (binding.context == NULL)
             return;
-        if (glIsTexture(binding.texture) && rectangleMatchesShadow(&binding))
-            gpuCopy(context, binding.shadow, GL_TEXTURE_2D, binding.texture, binding.target,
-                binding.width, binding.height);
+        // A GPU buffer gets what the CPU wrote in another process first.
+        if (binding.gpuBuffer)
+            _IOSurfaceGPUWillUse(binding.surface);
+        // The copy goes to the host driver directly, so the thread must hold
+        // the context's binding while it runs (a thread that only made the
+        // context current, or locked it, may not yet).
+        struct context_scope scope;
+        if (binding.shadow != 0 && enterContext(context, &scope, 0) == kCGLNoError) {
+            if (glIsTexture(binding.texture) && rectangleMatchesShadow(&binding))
+                gpuCopy(context, binding.shadow, GL_TEXTURE_2D, binding.texture, binding.target,
+                    binding.width, binding.height, binding.gpuBuffer);
+            leaveContext(context, &scope);
+        }
     }
 }
+
+static void writeBackTexture(CGLContextObj context, GLuint texture);
 
 CGLError CGLTexImageIOSurface2D(CGLContextObj ctx, GLenum target, GLenum internal_format,
                                 GLsizei width, GLsizei height, GLenum format, GLenum type,
@@ -3001,8 +3825,8 @@ CGLError CGLTexImageIOSurface2D(CGLContextObj ctx, GLenum target, GLenum interna
     if (error != kCGLNoError)
         return error;
 
-    CGLContextObj previous;
-    error = enterContext(ctx, &previous);
+    struct context_scope scope;
+    error = enterContext(ctx, &scope, 1);
     if (error != kCGLNoError)
         return error;
 
@@ -3011,19 +3835,35 @@ CGLError CGLTexImageIOSurface2D(CGLContextObj ctx, GLenum target, GLenum interna
     GLint texture = 0;
     glGetIntegerv(bindingQuery, &texture);
 
+    // Rendering into the texture since its last copy belongs to the surface
+    // it was specified from before.
+    if (texture != 0)
+        writeBackTexture(ctx, (GLuint) texture);
+    // A texture that used another surface's memory must have finished
+    // rendering into it before it uses this one's: nothing else waits for
+    // that rendering once the binding is gone.
+    struct surface_binding previousBinding;
+    if (texture != 0 && findSurfaceBinding(ctx, (GLuint) texture, &previousBinding) && previousBinding.imported
+        && previousBinding.dirty && (previousBinding.surface != ioSurface || previousBinding.plane != plane))
+        host_glFinish();
+
     // A texture that already uses this plane's memory in the same way is
     // left alone; it has the surface's current contents.
-    struct surface_binding previousBinding;
     GLint allocatedWidth = 0, allocatedHeight = 0, allocatedFormat = 0;
     glGetTexLevelParameteriv(target, 0, GL_TEXTURE_WIDTH, &allocatedWidth);
     glGetTexLevelParameteriv(target, 0, GL_TEXTURE_HEIGHT, &allocatedHeight);
     glGetTexLevelParameteriv(target, 0, GL_TEXTURE_INTERNAL_FORMAT, &allocatedFormat);
-    int imported = texture != 0 && findSurfaceBinding(ctx, (GLuint) texture, &previousBinding)
+    int hadBinding = texture != 0 && findSurfaceBinding(ctx, (GLuint) texture, &previousBinding);
+    int imported = hadBinding
         && previousBinding.imported && previousBinding.surface == ioSurface && previousBinding.plane == plane
         && previousBinding.target == target && previousBinding.internalFormat == internal_format
         && previousBinding.format == format && previousBinding.type == type
         && previousBinding.width == width && previousBinding.height == height
         && allocatedWidth == width && allocatedHeight == height;
+    int gpuBuffer = imported && previousBinding.gpuBuffer;
+    // The GPU buffer gets writes the CPU made in other processes.
+    if (gpuBuffer)
+        _IOSurfaceGPUWillUse(ioSurface);
 
     if (!imported && texture != 0)
         imported = importSurfacePlane(ctx, target, internal_format, width, height, format, type, ioSurface, plane);
@@ -3032,13 +3872,31 @@ CGLError CGLTexImageIOSurface2D(CGLContextObj ctx, GLenum target, GLenum interna
     GLuint shadow = 0;
     if (!imported)
         shadow = copySurfacePlaneToRectangle(ctx, target, texture, internal_format, width, height, format, type,
-                                             ioSurface, plane, &shadowFormat);
+                                             ioSurface, plane, NULL, &shadowFormat);
+
+    // A surface that has a GPU buffer is used through it where its memory
+    // cannot be.
+    _IOSurfaceGPUBuffer buffer;
+    if (!imported && shadow == 0 && texture != 0
+        && getGPUBuffer(ctx, ioSurface, plane, drmFormat(internal_format, format, type), width, height, 0, &buffer)) {
+        _IOSurfaceGPUWillUse(ioSurface);
+        if (target == GL_TEXTURE_2D)
+            imported = gpuBuffer = importGPUBuffer(ctx, internal_format, width, height, format, type, &buffer);
+        else
+            shadow = copySurfacePlaneToRectangle(ctx, target, texture, internal_format, width, height, format,
+                                                 type, ioSurface, plane, &buffer, &shadowFormat);
+        gpuBuffer = imported || shadow != 0;
+    }
 
     if (!imported && shadow == 0) {
-        // A failed import may have emptied the texture.
+        // A failed import may have emptied the texture. A texture that used
+        // other memory gets storage of its own, so that the upload does not
+        // write into that memory.
         glGetTexLevelParameteriv(target, 0, GL_TEXTURE_WIDTH, &allocatedWidth);
         glGetTexLevelParameteriv(target, 0, GL_TEXTURE_HEIGHT, &allocatedHeight);
         glGetTexLevelParameteriv(target, 0, GL_TEXTURE_INTERNAL_FORMAT, &allocatedFormat);
+        if (hadBinding && previousBinding.imported)
+            allocatedWidth = allocatedHeight = 0;
 
         struct pixel_store saved, transfer = { 0, rowLength, 0, 0, 1 };
         savePixelStore(0, &saved);
@@ -3047,16 +3905,20 @@ CGLError CGLTexImageIOSurface2D(CGLContextObj ctx, GLenum target, GLenum interna
         if (rowLength == 0) {
             // Rows that are not a whole number of pixels apart go up one by one.
             if (allocatedWidth != width || allocatedHeight != height || allocatedFormat != (GLint) internal_format)
-                glTexImage2D(target, 0, (GLint) internal_format, width, height, 0, format, type, NULL);
+                host_glTexImage2D(target, 0, (GLint) internal_format, width, height, 0, format, type, NULL);
             for (GLsizei row = 0; row < height; row++)
                 glTexSubImage2D(target, 0, 0, row, width, 1, format, type, (const char *) pixels + row * rowBytes);
         } else if (allocatedWidth == width && allocatedHeight == height && allocatedFormat == (GLint) internal_format)
             glTexSubImage2D(target, 0, 0, 0, width, height, format, type, pixels);
         else
-            glTexImage2D(target, 0, (GLint) internal_format, width, height, 0, format, type, pixels);
+            host_glTexImage2D(target, 0, (GLint) internal_format, width, height, 0, format, type, pixels);
 
         setPixelStore(0, &saved);
     }
+
+    // The texture's storage moved to or away from a GPU buffer.
+    if (texture != 0 && target == GL_TEXTURE_2D && (gpuBuffer || (hadBinding && previousBinding.gpuBuffer)))
+        reattachTexture(ctx, target, (GLuint) texture);
 
     if (texture != 0) {
         struct surface_binding binding = {
@@ -3066,42 +3928,160 @@ CGLError CGLTexImageIOSurface2D(CGLContextObj ctx, GLenum target, GLenum interna
             .imported = imported, .internalFormat = internal_format,
             .width = width, .height = height,
             .shadow = shadow, .shadowFormat = shadowFormat,
+            .gpuBuffer = gpuBuffer,
         };
         if (!rememberSurfaceBinding(&binding)) {
             if (shadow != 0 && !shadowInUseByAny(ctx, shadow))
-                glDeleteTextures(1, &shadow);
+                host_glDeleteTextures(1, &shadow);
             error = kCGLBadAlloc;
         }
     }
 
-    leaveContext(ctx, previous);
+    leaveContext(ctx, &scope);
     return error;
 }
 
 // Set while this thread copies a texture into a surface.
 static __thread int t_readingBack;
 
-// Records that the texture of binding matches its surface at seed.
+// Records that the texture of binding matches its surface at seed, so it
+// has nothing left to write back.
 static void setBindingSeed(const struct surface_binding *binding, uint32_t seed) {
     pthread_mutex_lock(&g_surfaceBindingsMutex);
     for (size_t i = 0; i < g_surfaceBindingCount; i++) {
         if (g_surfaceBindings[i].context == binding->context
             && g_surfaceBindings[i].texture == binding->texture
-            && g_surfaceBindings[i].surface == binding->surface)
+            && g_surfaceBindings[i].surface == binding->surface) {
             g_surfaceBindings[i].seed = seed;
+            g_surfaceBindings[i].dirty = 0;
+        }
     }
     pthread_mutex_unlock(&g_surfaceBindingsMutex);
+}
+
+// Records how the texture of binding now uses its surface (the fields
+// that moveToGPUBuffer changes).
+static void updateBinding(const struct surface_binding *binding) {
+    pthread_mutex_lock(&g_surfaceBindingsMutex);
+    for (size_t i = 0; i < g_surfaceBindingCount; i++) {
+        struct surface_binding *recorded = &g_surfaceBindings[i];
+        if (recorded->context == binding->context && recorded->texture == binding->texture
+            && recorded->surface == binding->surface) {
+            recorded->imported = binding->imported;
+            recorded->gpuBuffer = binding->gpuBuffer;
+            recorded->noGPUBuffer = binding->noGPUBuffer;
+            recorded->shadow = binding->shadow;
+            recorded->shadowFormat = binding->shadowFormat;
+            recorded->seed = binding->seed;
+            recorded->dirty = binding->dirty;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_surfaceBindingsMutex);
+}
+
+// Gives the surface of binding, whose texture holds a copy that has been
+// rendered into, a GPU buffer (see "GPU buffers"): the texture's contents
+// are copied into the buffer, and the texture uses the buffer from then on,
+// directly (a 2D texture) or through a shadow. The rendering is then
+// reported to IOSurface. In context, which is current and shares the
+// texture. Returns 0, changing nothing, if the context does not use GPU
+// buffers or the surface cannot have one.
+static int moveToGPUBuffer(CGLContextObj context, const struct surface_binding *binding) {
+    if (binding->imported || binding->shadow != 0 || binding->rendered == 0 || binding->noGPUBuffer)
+        return 0;
+    uint32_t fourcc = drmFormat(binding->internalFormat, binding->format, binding->type);
+    if (!gpuBufferUsable(context, fourcc))
+        return 0;
+    if (!glIsTexture(binding->texture) || !rectangleMatchesShadow(binding))
+        return 0;
+
+    struct surface_binding updated = *binding;
+    _IOSurfaceGPUBuffer buffer;
+    GLuint shadow = 0;
+    if (getGPUBuffer(context, binding->surface, binding->plane, fourcc, binding->width, binding->height, 1,
+                     &buffer))
+        shadow = shadowTexture(context, binding->surface, binding->plane, fourcc, binding->width,
+                               binding->height, &buffer);
+    if (shadow == 0) {
+        updated.noGPUBuffer = 1;
+        updateBinding(&updated);
+        return 0;
+    }
+    gpuCopy(context, binding->texture, binding->target, shadow, GL_TEXTURE_2D, binding->width,
+                      binding->height, 1);
+
+    updated.gpuBuffer = 1;
+    updated.dirty = 0;
+    updated.shadow = shadow;
+    updated.shadowFormat = fourcc;
+    if (binding->target == GL_TEXTURE_2D) {
+        // The texture becomes the buffer, as a texture specified from a
+        // surface that has one would; the temporary shadow goes.
+        GLint previous = 0;
+        glGetIntegerv(GL_TEXTURE_BINDING_2D, &previous);
+        glBindTexture(GL_TEXTURE_2D, binding->texture);
+        if (importGPUBuffer(context, binding->internalFormat, binding->width, binding->height, binding->format,
+                            binding->type, &buffer)) {
+            updated.imported = 1;
+            updated.shadow = 0;
+            updated.shadowFormat = 0;
+        } else {
+            // The texture may have been emptied; it keeps a copy of the
+            // buffer through the shadow instead.
+            struct pixel_store saved, none = { 0, 0, 0, 0, 4 };
+            savePixelStore(0, &saved);
+            setPixelStore(0, &none);
+            host_glTexImage2D(GL_TEXTURE_2D, 0, (GLint) binding->internalFormat, binding->width, binding->height, 0,
+                              binding->format, binding->type, NULL);
+            setPixelStore(0, &saved);
+            gpuCopy(context, shadow, GL_TEXTURE_2D, binding->texture, GL_TEXTURE_2D, binding->width,
+                              binding->height, 1);
+        }
+        glBindTexture(GL_TEXTURE_2D, (GLuint) previous);
+        reattachTexture(context, GL_TEXTURE_2D, binding->texture);
+        if (updated.imported && !shadowInUseByAny(context, shadow))
+            host_glDeleteTextures(1, &shadow);
+    }
+
+    // The rendering is in the buffer once the GPU is done; IOSurface then
+    // copies it into the memory and changes the seed.
+    host_glFinish();
+    _IOSurfaceGPUDidWriteBuffer(binding->surface);
+    updated.seed = IOSurfaceGetSeed(binding->surface);
+    updateBinding(&updated);
+    return 1;
 }
 
 // The most contexts whose work finishImportedSurface waits for at once.
 #define MAX_FINISHED_CONTEXTS 16
 
+// Rendering into the surface's GPU buffer through textures that context
+// shares, which the context has finished, is reported to IOSurface, which
+// copies it into the memory.
+static void reportFinishedBufferWrites(CGLContextObj context, IOSurfaceRef ioSurface) {
+    pthread_mutex_lock(&g_surfaceBindingsMutex);
+    int report = 0;
+    for (size_t i = 0; i < g_surfaceBindingCount; i++) {
+        struct surface_binding *binding = &g_surfaceBindings[i];
+        if (binding->surface == ioSurface && binding->gpuBuffer && binding->unflushed
+            && sharesTextures(binding->context, context)) {
+            binding->unflushed = 0;
+            report = 1;
+        }
+    }
+    if (report)
+        _IOSurfaceGPUDidWriteBuffer(ioSurface);
+    pthread_mutex_unlock(&g_surfaceBindingsMutex);
+}
+
 // Waits for the GL work of the contexts that have textures using the
-// surface's memory, so that the memory holds their rendering. A context
-// current on another thread cannot be made current here and is skipped; its
-// application flushes it before handing the surface on, as on macOS.
-// Returns whether the surface has any such texture.
-static int finishImportedSurface(IOSurfaceRef ioSurface) {
+// surface's memory or GPU buffer, so that it holds their rendering, and with
+// reportBuffers, has the rendering in the GPU buffer copied into the memory.
+// A context current on another thread cannot be made current here and is
+// skipped; its application flushes it before handing the surface on, as on
+// macOS. Returns whether the surface has any such texture.
+static int finishImportedSurface(IOSurfaceRef ioSurface, int reportBuffers) {
     CGLContextObj contexts[MAX_FINISHED_CONTEXTS];
     size_t count = 0;
     int found = 0;
@@ -3120,34 +4100,129 @@ static int finishImportedSurface(IOSurfaceRef ioSurface) {
     pthread_mutex_unlock(&g_surfaceBindingsMutex);
 
     for (size_t i = 0; i < count; i++) {
-        CGLContextObj previous;
-        if (enterContext(contexts[i], &previous) == kCGLNoError) {
-            glFinish();
-            leaveContext(contexts[i], previous);
+        struct context_scope scope;
+        if (enterContext(contexts[i], &scope, 0) == kCGLNoError) {
+            host_glFinish();
+            leaveContext(contexts[i], &scope);
+            if (reportBuffers)
+                reportFinishedBufferWrites(contexts[i], ioSurface);
         }
         CGLReleaseContext(contexts[i]);
     }
     return found;
 }
 
+// Copies the texture of binding, which holds a copy of its surface, into
+// the surface, in context, which is current and shares the texture. On the
+// GPU through the shadow if there is one, else through the CPU.
+static CGLError copyBindingToSurface(CGLContextObj context, const struct surface_binding *binding) {
+    IOSurfaceRef ioSurface = binding->surface;
+    if (moveToGPUBuffer(context, binding))
+        return kCGLNoError;
+    if (binding->shadow != 0) {
+        // The shadow is the surface's memory: the copy lands there once the
+        // GPU is done, and a lock marks the surface modified, as the CPU
+        // copy does. A texture respecified since is left alone.
+        if (!glIsTexture(binding->texture) || !rectangleMatchesShadow(binding))
+            return kCGLBadValue;
+        gpuCopy(context, binding->texture, binding->target, binding->shadow, GL_TEXTURE_2D,
+                          binding->width, binding->height, binding->gpuBuffer);
+        host_glFinish();
+        if (binding->gpuBuffer) {
+            // The shadow is the GPU buffer, which IOSurface copies into the
+            // memory.
+            _IOSurfaceGPUDidWriteBuffer(ioSurface);
+            setBindingSeed(binding, IOSurfaceGetSeed(ioSurface));
+            return kCGLNoError;
+        }
+        uint32_t seed = 0;
+        t_readingBack = 1;
+        IOSurfaceLock(ioSurface, 0, NULL);
+        IOSurfaceUnlock(ioSurface, 0, &seed);
+        t_readingBack = 0;
+        setBindingSeed(binding, seed);
+        return kCGLNoError;
+    }
+
+    if (!glIsTexture(binding->texture))
+        return kCGLBadValue;
+    GLenum bindingQuery = textureBindingQuery(binding->target);
+    GLint oldTexture = 0, width = 0, height = 0;
+    glGetIntegerv(bindingQuery, &oldTexture);
+    glBindTexture(binding->target, binding->texture);
+    glGetTexLevelParameteriv(binding->target, 0, GL_TEXTURE_WIDTH, &width);
+    glGetTexLevelParameteriv(binding->target, 0, GL_TEXTURE_HEIGHT, &height);
+
+    // The texture may have been respecified since; it must still fit.
+    void *pixels;
+    GLint rowLength;
+    size_t rowBytes, pixelBytes;
+    CGLError error = planeForTransfer(ioSurface, binding->plane, width, height, binding->format, binding->type,
+                                      &pixels, &rowLength, &rowBytes, &pixelBytes);
+    if (error == kCGLNoError) {
+        struct pixel_store saved, transfer = { 0, rowLength, 0, 0, 1 };
+        savePixelStore(1, &saved);
+        setPixelStore(1, &transfer);
+        uint32_t seed = 0;
+        t_readingBack = 1;
+        IOSurfaceLock(ioSurface, 0, NULL);
+        if (rowLength == 0) {
+            // Rows that are not a whole number of pixels apart: read the
+            // texture packed and copy the rows to where they belong.
+            size_t packedRow = (size_t) width * pixelBytes;
+            uint8_t *packed = malloc(packedRow * (size_t) height);
+            if (packed != NULL) {
+                glGetTexImage(binding->target, 0, binding->format, binding->type, packed);
+                for (GLint row = 0; row < height; row++)
+                    memcpy((uint8_t *) pixels + row * rowBytes, packed + row * packedRow, packedRow);
+                free(packed);
+            }
+        } else {
+            glGetTexImage(binding->target, 0, binding->format, binding->type, pixels);
+        }
+        IOSurfaceUnlock(ioSurface, 0, &seed);
+        t_readingBack = 0;
+        setPixelStore(1, &saved);
+        setBindingSeed(binding, seed);
+    }
+
+    glBindTexture(binding->target, (GLuint) oldTexture);
+    return error;
+}
+
 // Brings GL rendering on ioSurface into the surface's memory. Textures that
 // use the memory itself only need their contexts' work to finish. A texture
-// that holds a copy, the one last specified from the surface, is copied into
-// the surface, on the GPU through its shadow if it has one; with
-// onlyIfUnmodified, not if the CPU has written the surface since the texture
-// last matched it, as its contents are newer then.
+// that holds a copy is copied into the surface: the one last rendered into
+// (see "Writing GL rendering back into surfaces"), or, if none has been and
+// no texture uses the memory, the one last specified from the surface.
+// With onlyIfUnmodified, not if
+// the CPU has written the surface since the texture last matched it, as
+// its contents are newer then.
 static CGLError readBackSurface(IOSurfaceRef ioSurface, int onlyIfUnmodified) {
-    int imported = finishImportedSurface(ioSurface);
+    int imported = finishImportedSurface(ioSurface, 1);
 
     struct surface_binding binding = { 0 };
     pthread_mutex_lock(&g_surfaceBindingsMutex);
+    size_t chosen = SIZE_MAX;
     for (size_t i = g_surfaceBindingCount; i-- > 0; ) {
-        if (g_surfaceBindings[i].surface == ioSurface && !g_surfaceBindings[i].imported) {
-            binding = g_surfaceBindings[i];
-            break;
-        }
+        if (g_surfaceBindings[i].surface != ioSurface || g_surfaceBindings[i].imported)
+            continue;
+        if (chosen == SIZE_MAX || g_surfaceBindings[i].rendered > g_surfaceBindings[chosen].rendered)
+            chosen = i;
     }
+    if (chosen != SIZE_MAX)
+        binding = g_surfaceBindings[chosen];
     if (binding.context && onlyIfUnmodified && IOSurfaceGetSeed(ioSurface) != binding.seed)
+        binding.context = NULL;
+    // Where textures use the surface's memory, the memory has their
+    // rendering, and a copy not rendered into since it was last copied
+    // holds nothing newer.
+    if (binding.context && imported && !binding.dirty)
+        binding.context = NULL;
+    // A texture whose rendering has been noted and written back since holds
+    // nothing newer either. Other textures are copied, so that changes made
+    // in other ways (glTexSubImage2D, glCopyTexSubImage2D) reach the surface.
+    if (binding.context && onlyIfUnmodified && binding.rendered != 0 && !binding.dirty)
         binding.context = NULL;
     if (binding.context)
         CGLRetainContext(binding.context);
@@ -3165,78 +4240,16 @@ static CGLError readBackSurface(IOSurfaceRef ioSurface, int onlyIfUnmodified) {
         return kCGLNoError;
     }
 
-    CGLContextObj previous;
-    CGLError error = enterContext(binding.context, &previous);
-    if (error != kCGLNoError) {
-        CGLReleaseContext(binding.context);
-        return error;
-    }
-
-    if (binding.shadow != 0) {
-        // The shadow is the surface's memory: the copy lands there once the
-        // GPU is done, and a lock marks the surface modified, as the CPU
-        // copy does. A texture respecified since is left alone.
-        if (!glIsTexture(binding.texture) || !rectangleMatchesShadow(&binding)) {
-            leaveContext(binding.context, previous);
-            CGLReleaseContext(binding.context);
-            return kCGLBadValue;
-        }
-        gpuCopy(binding.context, binding.texture, binding.target, binding.shadow, GL_TEXTURE_2D,
-                binding.width, binding.height);
-        glFinish();
-        uint32_t seed = 0;
-        t_readingBack = 1;
-        IOSurfaceLock(ioSurface, 0, NULL);
-        IOSurfaceUnlock(ioSurface, 0, &seed);
-        t_readingBack = 0;
-        setBindingSeed(&binding, seed);
-        leaveContext(binding.context, previous);
-        CGLReleaseContext(binding.context);
-        return kCGLNoError;
-    }
-
-    GLenum bindingQuery = textureBindingQuery(binding.target);
-    GLint oldTexture = 0, width = 0, height = 0;
-    glGetIntegerv(bindingQuery, &oldTexture);
-    glBindTexture(binding.target, binding.texture);
-    glGetTexLevelParameteriv(binding.target, 0, GL_TEXTURE_WIDTH, &width);
-    glGetTexLevelParameteriv(binding.target, 0, GL_TEXTURE_HEIGHT, &height);
-
-    // The texture may have been respecified since; it must still fit.
-    void *pixels;
-    GLint rowLength;
-    size_t rowBytes, pixelBytes;
-    error = planeForTransfer(ioSurface, binding.plane, width, height, binding.format, binding.type,
-                             &pixels, &rowLength, &rowBytes, &pixelBytes);
+    // A context current here that shares the texture copies it without a
+    // switch; otherwise the binding's own context is made current.
+    CGLContextObj current = CGLGetCurrentContext();
+    CGLContextObj copier = current && sharesTextures(current, binding.context) ? current : binding.context;
+    struct context_scope scope;
+    CGLError error = enterContext(copier, &scope, 0);
     if (error == kCGLNoError) {
-        struct pixel_store saved, transfer = { 0, rowLength, 0, 0, 1 };
-        savePixelStore(1, &saved);
-        setPixelStore(1, &transfer);
-        uint32_t seed = 0;
-        t_readingBack = 1;
-        IOSurfaceLock(ioSurface, 0, NULL);
-        if (rowLength == 0) {
-            // Rows that are not a whole number of pixels apart: read the
-            // texture packed and copy the rows to where they belong.
-            size_t packedRow = (size_t) width * pixelBytes;
-            uint8_t *packed = malloc(packedRow * (size_t) height);
-            if (packed != NULL) {
-                glGetTexImage(binding.target, 0, binding.format, binding.type, packed);
-                for (GLint row = 0; row < height; row++)
-                    memcpy((uint8_t *) pixels + row * rowBytes, packed + row * packedRow, packedRow);
-                free(packed);
-            }
-        } else {
-            glGetTexImage(binding.target, 0, binding.format, binding.type, pixels);
-        }
-        IOSurfaceUnlock(ioSurface, 0, &seed);
-        t_readingBack = 0;
-        setPixelStore(1, &saved);
-        setBindingSeed(&binding, seed);
+        error = copyBindingToSurface(copier, &binding);
+        leaveContext(copier, &scope);
     }
-
-    glBindTexture(binding.target, (GLuint) oldTexture);
-    leaveContext(binding.context, previous);
     CGLReleaseContext(binding.context);
     return error;
 }
@@ -3252,9 +4265,368 @@ CGLError CGLReadbackIOSurface(IOSurfaceRef ioSurface) {
 // rendering, so it is copied into the surface unless the CPU has written
 // the surface since. A surface with no texture, or one this thread is
 // already copying into, is left alone.
+static void noteDrawFramebuffer(CGLContextObj context);
+
 static void writeBackSurface(IOSurfaceRef ioSurface) {
+    if (t_readingBack)
+        return;
+    // Rendering of this thread's context is noted first, so that the
+    // texture last rendered into is the one copied.
+    // (The query goes to the host driver directly: the thread must hold the
+    // binding of its current context, which a lock of the surface may find
+    // given up.)
+    CGLContextObj current = CGLGetCurrentContext();
+    struct context_scope scope;
+    if (current != NULL && enterContext(current, &scope, 0) == kCGLNoError) {
+        noteDrawFramebuffer(current);
+        leaveContext(current, &scope);
+    }
+    readBackSurface(ioSurface, 1);
+}
+
+// IOSurface's finish callback, before a lock with kIOSurfaceLockAvoidSync:
+// rendering into textures that use the surface's memory is waited for, and
+// nothing is copied.
+static void finishSurface(IOSurfaceRef ioSurface) {
     if (!t_readingBack)
-        readBackSurface(ioSurface, 1);
+        finishImportedSurface(ioSurface, 0);
+}
+
+// Writing GL rendering back into surfaces.
+//
+// On macOS the surface is the storage of a texture specified from it, so
+// rendering into the texture is in the surface for the CPU and for other
+// contexts and processes once the producer has flushed it, whatever happens
+// to the texture afterwards. A texture that holds a copy of its surface has
+// the rendering only in the texture, so this framework copies it into the
+// surface:
+//  - when a context that shares the texture calls glFlush, glFinish,
+//    glFenceSync or CGLFlushDrawable;
+//  - before the texture is deleted (glDeleteTextures), or its level 0 is
+//    given other contents (glTexImage2D, which the host carries out, while
+//    on macOS the texture keeps the surface) or specified from another
+//    surface (CGLTexImageIOSurface2D).
+// Only textures that may have been rendered into since their last copy are
+// copied, once each. Rendering is noted, without following individual
+// draws, when the texture is a color attachment of the context's draw
+// framebuffer at one of these calls, when another draw framebuffer is
+// bound, when the framebuffer is deleted, and before a lock of the
+// surface. The copy keeps to the rule of the copy before a lock: a CPU write
+// made since the texture last matched the surface is newer and is kept.
+//
+// The copy is made in the calling context, which shares the texture, so
+// that no other context has to be made current.
+//
+// IOSurface is told about the rendering as it is noted. Rendering into a
+// copy is reported with _IOSurfaceGPUDidWrite, so that a lock with
+// kIOSurfaceLockAvoidSync fails until the copy has been written back.
+// Rendering into a surface's memory is reported with
+// _IOSurfaceGPUDidWriteMemory at the next of these calls, so that the seed
+// changes, as it does on macOS when a flush makes rendering into a surface
+// visible. A lock with kIOSurfaceLockAvoidSync waits for that rendering
+// (the finish callback) but copies nothing.
+
+// The most color attachments of one framebuffer that are looked at.
+
+// Whether a context that shares textures with context has a texture
+// specified from a surface.
+static int sharesBinding(CGLContextObj context) {
+    int found = 0;
+    pthread_mutex_lock(&g_surfaceBindingsMutex);
+    for (size_t i = 0; i < g_surfaceBindingCount && !found; i++)
+        found = sharesTextures(g_surfaceBindings[i].context, context);
+    pthread_mutex_unlock(&g_surfaceBindingsMutex);
+    return found;
+}
+
+// The current context, if there may be anything for it to write back.
+static CGLContextObj contextWithCopies(void) {
+    if (atomic_load_explicit(&g_bindingCount, memory_order_relaxed) == 0 || t_readingBack)
+        return NULL;
+    return CGLGetCurrentContext();
+}
+
+// Notes rendering into the textures specified from surfaces that are color
+// attachments of the draw framebuffer of context, which is current.
+static void noteDrawFramebuffer(CGLContextObj context) {
+    if (atomic_load_explicit(&g_bindingCount, memory_order_relaxed) == 0 || t_readingBack
+        || !sharesBinding(context))
+        return;
+    GLint framebuffer = 0;
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &framebuffer);
+    if (framebuffer == 0)
+        return;
+    if (context->max_color_attachments == 0) {
+        GLint max = 0;
+        glGetIntegerv(GL_MAX_COLOR_ATTACHMENTS, &max);
+        context->max_color_attachments = max < 1 ? 1 : max > CGL_MAX_NOTED_ATTACHMENTS ? CGL_MAX_NOTED_ATTACHMENTS : max;
+    }
+    GLuint textures[CGL_MAX_NOTED_ATTACHMENTS];
+    int count = 0;
+    for (GLint i = 0; i < context->max_color_attachments; i++) {
+        GLint type = GL_NONE, name = 0;
+        host_glGetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0 + i,
+                                                   GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, &type);
+        if (type != GL_TEXTURE)
+            continue;
+        host_glGetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0 + i,
+                                                   GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &name);
+        if (name != 0)
+            textures[count++] = (GLuint) name;
+    }
+    if (count == 0)
+        return;
+    pthread_mutex_lock(&g_surfaceBindingsMutex);
+    for (size_t i = 0; i < g_surfaceBindingCount; i++) {
+        struct surface_binding *binding = &g_surfaceBindings[i];
+        if (!sharesTextures(binding->context, context))
+            continue;
+        for (int j = 0; j < count; j++) {
+            if (binding->texture == textures[j]) {
+                binding->dirty = 1;
+                binding->rendered = ++g_renderSerial;
+                // A copy is newer than the surface until it is written
+                // back, which it is unless the CPU has written the surface
+                // since the copy last matched it.
+                if (binding->imported)
+                    binding->unflushed = 1;
+                else if (IOSurfaceGetSeed(binding->surface) == binding->seed)
+                    _IOSurfaceGPUDidWrite(binding->surface);
+                break;
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_surfaceBindingsMutex);
+}
+
+// Copies the textures that context shares and that may have been rendered
+// into since their last copy (only texture, unless it is 0) into their
+// surfaces. context is current.
+static void writeBackRendered(CGLContextObj context, GLuint texture) {
+    for (;;) {
+        struct surface_binding binding;
+        int found = 0;
+        pthread_mutex_lock(&g_surfaceBindingsMutex);
+        for (size_t i = 0; i < g_surfaceBindingCount && !found; i++) {
+            struct surface_binding *candidate = &g_surfaceBindings[i];
+            if (candidate->imported || !candidate->dirty || !sharesTextures(candidate->context, context)
+                || (texture != 0 && candidate->texture != texture))
+                continue;
+            candidate->dirty = 0;
+            binding = *candidate;
+            CFRetain(binding.surface);
+            found = 1;
+        }
+        pthread_mutex_unlock(&g_surfaceBindingsMutex);
+        if (!found)
+            return;
+        if (IOSurfaceGetSeed(binding.surface) == binding.seed)
+            copyBindingToSurface(context, &binding);
+        CFRelease(binding.surface);
+    }
+}
+
+// Rendering into the memory or the GPU buffer of surfaces through textures
+// that context, which is current, shares has been submitted: the surfaces'
+// contents have changed. The rendering is finished first: IOSurface copies a
+// GPU buffer into the memory, and readers of the memory cannot wait for it.
+static void reportMemoryWrites(CGLContextObj context) {
+    pthread_mutex_lock(&g_surfaceBindingsMutex);
+    int finished = 0;
+    for (size_t i = 0; i < g_surfaceBindingCount; i++) {
+        struct surface_binding *binding = &g_surfaceBindings[i];
+        if (!binding->unflushed || !sharesTextures(binding->context, context))
+            continue;
+        // Bindings of the same surface are reported once.
+        for (size_t j = i; j < g_surfaceBindingCount; j++) {
+            if (g_surfaceBindings[j].surface == binding->surface
+                && g_surfaceBindings[j].gpuBuffer == binding->gpuBuffer
+                && sharesTextures(g_surfaceBindings[j].context, context))
+                g_surfaceBindings[j].unflushed = 0;
+        }
+        // glFlush only submits the work, but on macOS the memory holds the
+        // rendering once the producer has flushed. A reader in this process
+        // waits for it in its lock; one in another process cannot wait for
+        // this context's work, so for a surface that another process may
+        // map the work is finished (once per call) before the report.
+        if (!finished && (binding->gpuBuffer || _IOSurfaceIsShared(binding->surface))) {
+            host_glFinish();
+            finished = 1;
+        }
+        if (binding->gpuBuffer)
+            _IOSurfaceGPUDidWriteBuffer(binding->surface);
+        else
+            _IOSurfaceGPUDidWriteMemory(binding->surface);
+    }
+    pthread_mutex_unlock(&g_surfaceBindingsMutex);
+}
+
+static void writeBackCurrentContext(void) {
+    CGLContextObj context = contextWithCopies();
+    if (context == NULL)
+        return;
+    noteDrawFramebuffer(context);
+    writeBackRendered(context, 0);
+    reportMemoryWrites(context);
+}
+
+// Set while glTexImage2D specifies a texture from its surface again, whose
+// contents are then not the rendering's.
+static __thread int t_respecifying;
+
+static void writeBackTexture(CGLContextObj context, GLuint texture) {
+    if (atomic_load_explicit(&g_bindingCount, memory_order_relaxed) == 0 || t_readingBack || t_respecifying)
+        return;
+    noteDrawFramebuffer(context);
+    writeBackRendered(context, texture);
+}
+
+// Whether a texture that context shares uses its surface's memory or GPU
+// buffer.
+static int textureImported(CGLContextObj context, GLuint texture) {
+    int imported = 0;
+    pthread_mutex_lock(&g_surfaceBindingsMutex);
+    for (size_t i = 0; i < g_surfaceBindingCount && !imported; i++) {
+        imported = g_surfaceBindings[i].imported && g_surfaceBindings[i].texture == texture
+            && sharesTextures(g_surfaceBindings[i].context, context);
+    }
+    pthread_mutex_unlock(&g_surfaceBindingsMutex);
+    return imported;
+}
+
+// Writes the texture, which context shares and which is current, back into
+// its surface and drops its bindings, as it is deleted, so that the surface
+// is released as on macOS. A texture that uses the surface's memory or GPU
+// buffer has its rendering finished first: no later lock of the surface
+// waits for a context without textures on it.
+static void releaseTextureBindings(CGLContextObj context, GLuint texture) {
+    writeBackRendered(context, texture);
+    if (textureImported(context, texture))
+        host_glFinish();
+    GLuint unused[8];
+    int unusedCount = 0;
+    pthread_mutex_lock(&g_surfaceBindingsMutex);
+    for (size_t i = 0; i < g_surfaceBindingCount; ) {
+        struct surface_binding *binding = &g_surfaceBindings[i];
+        if (binding->texture != texture || !sharesTextures(binding->context, context)) {
+            i++;
+            continue;
+        }
+        GLuint shadow = binding->shadow;
+        removeSurfaceBinding(i);
+        int used = 0;
+        for (size_t j = 0; j < g_surfaceBindingCount && !used; j++)
+            used = g_surfaceBindings[j].shadow == shadow && sharesTextures(g_surfaceBindings[j].context, context);
+        for (int j = 0; j < unusedCount && !used; j++)
+            used = unused[j] == shadow;
+        if (shadow != 0 && !used && unusedCount < (int) (sizeof(unused) / sizeof(unused[0])))
+            unused[unusedCount++] = shadow;
+    }
+    pthread_mutex_unlock(&g_surfaceBindingsMutex);
+    if (unusedCount > 0)
+        host_glDeleteTextures(unusedCount, unused);
+}
+
+void override_glFlush(void) {
+    writeBackCurrentContext();
+    host_glFlush();
+}
+
+void override_glFinish(void) {
+    writeBackCurrentContext();
+    host_glFinish();
+}
+
+// The copies are made before the fence, so waiting for it covers them.
+GLsync override_glFenceSync(GLenum condition, GLbitfield flags) {
+    writeBackCurrentContext();
+    return host_glFenceSync(condition, flags);
+}
+
+static void noteCurrentDrawFramebuffer(GLenum target) {
+    CGLContextObj context = contextWithCopies();
+    if (context != NULL && target != GL_READ_FRAMEBUFFER)
+        noteDrawFramebuffer(context);
+}
+
+void override_glBindFramebuffer(GLenum target, GLuint framebuffer) {
+    noteCurrentDrawFramebuffer(target);
+    host_glBindFramebuffer(target, framebuffer);
+}
+
+void override_glBindFramebufferEXT(GLenum target, GLuint framebuffer) {
+    noteCurrentDrawFramebuffer(target);
+    host_glBindFramebufferEXT(target, framebuffer);
+}
+
+void override_glDeleteFramebuffers(GLsizei n, const GLuint *framebuffers) {
+    noteCurrentDrawFramebuffer(GL_DRAW_FRAMEBUFFER);
+    host_glDeleteFramebuffers(n, framebuffers);
+}
+
+void override_glDeleteFramebuffersEXT(GLsizei n, const GLuint *framebuffers) {
+    noteCurrentDrawFramebuffer(GL_DRAW_FRAMEBUFFER);
+    host_glDeleteFramebuffersEXT(n, framebuffers);
+}
+
+void override_glDeleteTextures(GLsizei n, const GLuint *textures) {
+    CGLContextObj context = contextWithCopies();
+    if (context != NULL && n > 0 && textures != NULL) {
+        noteDrawFramebuffer(context);
+        for (GLsizei i = 0; i < n; i++) {
+            if (textures[i] != 0)
+                releaseTextureBindings(context, textures[i]);
+        }
+    }
+    host_glDeleteTextures(n, textures);
+}
+
+// QUIRK: glTexImage2D on level 0 of a texture specified from a surface
+// leaves the texture the surface's, with its size and contents: rendering
+// before the call stays in the surface and rendering after it reaches the
+// surface. Not documented. Evidence: black-box observation on macOS 26.7.3
+// (tier 2), Apple Software Renderer, rectangle textures, with and without
+// pixel data and with another size; the call raises GL_INVALID_OPERATION
+// there, which is not reproduced here. Test: the respecify case of
+// tests/src/opengl_iosurface_writeback.m.
+// The host carries the call out, so what was rendered before is written
+// back first and the texture is then specified from the surface again.
+void override_glTexImage2D(GLenum target, GLint level, GLint internalFormat, GLsizei width, GLsizei height,
+                             GLint border, GLenum format, GLenum type, const GLvoid *pixels) {
+    CGLContextObj context = NULL;
+    GLint texture = 0;
+    struct surface_binding binding;
+    int bound = 0;
+    if (level == 0 && (target == GL_TEXTURE_2D || target == GL_TEXTURE_RECTANGLE)
+        && (context = contextWithCopies()) != NULL) {
+        glGetIntegerv(textureBindingQuery(target), &texture);
+        if (texture != 0) {
+            writeBackTexture(context, (GLuint) texture);
+            bound = findSurfaceBinding(context, (GLuint) texture, &binding) && binding.target == target;
+            if (bound)
+                CFRetain(binding.surface);
+        }
+    }
+    host_glTexImage2D(target, level, internalFormat, width, height, border, format, type, pixels);
+    if (bound) {
+        // A texture that used the surface's memory does not any more; it is
+        // imported again.
+        if (binding.imported) {
+            pthread_mutex_lock(&g_surfaceBindingsMutex);
+            for (size_t i = 0; i < g_surfaceBindingCount; i++) {
+                if (g_surfaceBindings[i].context == context && g_surfaceBindings[i].texture == (GLuint) texture) {
+                    removeSurfaceBinding(i);
+                    break;
+                }
+            }
+            pthread_mutex_unlock(&g_surfaceBindingsMutex);
+        }
+        t_respecifying = 1;
+        CGLTexImageIOSurface2D(context, target, binding.internalFormat, binding.width, binding.height,
+                               binding.format, binding.type, binding.surface, binding.plane);
+        t_respecifying = 0;
+        CFRelease(binding.surface);
+    }
 }
 
 CGLError CGLSetDrawableRefreshRate(CGLContextObj context, uint32_t millihertz) {
@@ -3275,7 +4647,14 @@ CGLError CGLSetParameter(CGLContextObj context, CGLContextParameter parameter, c
     {
         GLint v = *value;
         EGLBoolean success = EGL_TRUE;
-        if (CGLGetCurrentContext() == context && atomic_load_explicit(&context->egl_surface, memory_order_acquire) != EGL_NO_SURFACE)
+        // EGL sets the interval of the surface current on the calling thread:
+        // a context this thread holds. A context that is current here but not
+        // held (parked, or given up after its last call) gets the interval
+        // when it is bound again (see bindCurrentContext).
+        pthread_mutex_lock(&g_bindingMutex);
+        int held = threadHoldsBinding(context);
+        pthread_mutex_unlock(&g_bindingMutex);
+        if (held && atomic_load_explicit(&context->egl_surface, memory_order_acquire) != EGL_NO_SURFACE)
             success = p_eglSwapInterval(context->egl_display, context->paced ? 0 : v);
         if (success)
             context->swap_interval = v;

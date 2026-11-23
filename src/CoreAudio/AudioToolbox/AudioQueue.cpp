@@ -1,5 +1,6 @@
 #include "AudioQueue.h"
 #include "AudioQueueOutput.h"
+#include "AudioQueueInput.h"
 #include <CarbonCore/MacErrors.h>
 
 OSStatus AudioQueueStart(AudioQueueRef inAQ, const AudioTimeStamp *inStartTime)
@@ -49,8 +50,19 @@ OSStatus AudioQueueNewInput(const AudioStreamBasicDescription *inFormat,
 		CFStringRef inCallbackRunLoopMode, UInt32 inFlags,
 		AudioQueueRef *outAQ)
 {
-	*outAQ = nullptr;
-	return unimpErr;
+	return AudioQueueInput::create(inFormat, inCallbackProc, inUserData, inCallbackRunLoop,
+			inCallbackRunLoopMode, nullptr, nullptr, (AudioQueueInput**) outAQ);
+}
+
+OSStatus AudioQueueNewInputWithDispatchQueue(AudioQueueRef *outAQ,
+		const AudioStreamBasicDescription *inFormat, UInt32 inFlags,
+		dispatch_queue_t inCallbackDispatchQueue,
+		AudioQueueInputCallbackBlock inCallbackBlock)
+{
+	if (!inCallbackDispatchQueue || !inCallbackBlock)
+		return kAudio_ParamError;
+	return AudioQueueInput::create(inFormat, nullptr, nullptr, nullptr, nullptr,
+			inCallbackDispatchQueue, inCallbackBlock, (AudioQueueInput**) outAQ);
 }
 
 OSStatus AudioQueueDispose(AudioQueueRef inAQ, Boolean inImmediate)
@@ -85,12 +97,16 @@ OSStatus AudioQueueGetPropertySize(AudioQueueRef inAQ, AudioQueuePropertyID inID
 
 OSStatus AudioQueueAddPropertyListener(AudioQueueRef inAQ, AudioQueuePropertyID inID, AudioQueuePropertyListenerProc inProc, void *inUserData)
 {
+	if (!inAQ)
+		return paramErr;
 	return inAQ->addPropertyListener(inID, inProc, inUserData);
 }
 
 OSStatus AudioQueueRemovePropertyListener(AudioQueueRef inAQ, AudioQueuePropertyID inID, AudioQueuePropertyListenerProc inProc, void *inUserData)
 {
-	return inAQ->addPropertyListener(inID, inProc, inUserData);
+	if (!inAQ)
+		return paramErr;
+	return inAQ->removePropertyListener(inID, inProc, inUserData);
 }
 
 OSStatus AudioQueueSetOfflineRenderFormat(AudioQueueRef inAQ, const AudioStreamBasicDescription *inFormat, const AudioChannelLayout *inLayout)
@@ -133,14 +149,72 @@ OSStatus AudioQueueEnqueueBufferWithParameters(AudioQueueRef inAQ,
 		UInt32 inNumParamValues, const AudioQueueParameterEvent *inParamValues,
 		const AudioTimeStamp *inStartTime, AudioTimeStamp *outActualStartTime)
 {
-	// Trimming, scheduled start times and per-buffer parameters are not supported:
-	// accept the plain case only, rather than play something else than asked.
-	if (inTrimFramesAtStart || inTrimFramesAtEnd || inNumParamValues || inStartTime || outActualStartTime)
-		return unimpErr;
-	return inAQ->enqueueBuffer(inBuffer, inNumPacketDescs, inPacketDescs);
+	return inAQ->enqueueBufferWithParameters(inBuffer, inNumPacketDescs, inPacketDescs, inTrimFramesAtStart,
+			inTrimFramesAtEnd, inNumParamValues, inParamValues, inStartTime, outActualStartTime);
+}
+
+// A timeline lets a client learn whether the queue's sample time was interrupted, as
+// when its output device changes. The queue always plays to the default output unit,
+// whose timeline runs on, so a timeline never reports a discontinuity.
+struct OpaqueAudioQueueTimeline
+{
+	AudioQueueRef queue;
+};
+
+OSStatus AudioQueueCreateTimeline(AudioQueueRef inAQ, AudioQueueTimelineRef *outTimeline)
+{
+	if (!inAQ || !outTimeline)
+		return kAudio_ParamError;
+	*outTimeline = new OpaqueAudioQueueTimeline { inAQ };
+	return noErr;
+}
+
+OSStatus AudioQueueDisposeTimeline(AudioQueueRef inAQ, AudioQueueTimelineRef inTimeline)
+{
+	if (!inAQ || !inTimeline || inTimeline->queue != inAQ)
+		return kAudio_ParamError;
+	delete inTimeline;
+	return noErr;
 }
 
 OSStatus AudioQueueGetCurrentTime(AudioQueueRef inAQ, AudioQueueTimelineRef inTimeline, AudioTimeStamp *outTimeStamp, Boolean *outTimelineDiscontinuity)
 {
+	if (!inAQ)
+		return kAudio_ParamError;
+	if (inTimeline && inTimeline->queue != inAQ)
+		return kAudio_ParamError;
 	return inAQ->getCurrentTime(outTimeStamp, outTimelineDiscontinuity);
+}
+
+OSStatus AudioQueueProcessingTapNew(AudioQueueRef inAQ, AudioQueueProcessingTapCallback inCallback,
+		void* inClientData, AudioQueueProcessingTapFlags inFlags, UInt32* outMaxFrames,
+		AudioStreamBasicDescription* outProcessingFormat, AudioQueueProcessingTapRef* outAQTap)
+{
+	if (!inAQ || !inCallback || !outMaxFrames || !outProcessingFormat || !outAQTap)
+		return kAudioQueueErr_InvalidParameter;
+	return inAQ->processingTapNew(inCallback, inClientData, inFlags, outMaxFrames, outProcessingFormat, outAQTap);
+}
+
+OSStatus AudioQueueProcessingTapDispose(AudioQueueProcessingTapRef inAQTap)
+{
+	if (!inAQTap)
+		return kAudioQueueErr_InvalidParameter;
+	return inAQTap->queue->processingTapDispose(inAQTap);
+}
+
+OSStatus AudioQueueProcessingTapGetSourceAudio(AudioQueueProcessingTapRef inAQTap, UInt32 inNumberFrames,
+		AudioTimeStamp* ioTimeStamp, AudioQueueProcessingTapFlags* outFlags, UInt32* outNumberFrames,
+		AudioBufferList* ioData)
+{
+	if (!inAQTap)
+		return kAudioQueueErr_InvalidParameter;
+	return inAQTap->queue->processingTapGetSourceAudio(inAQTap, inNumberFrames, ioTimeStamp, outFlags, outNumberFrames, ioData);
+}
+
+OSStatus AudioQueueProcessingTapGetQueueTime(AudioQueueProcessingTapRef inAQTap,
+		Float64* outQueueSampleTime, UInt32* outQueueFrameCount)
+{
+	if (!inAQTap)
+		return kAudioQueueErr_InvalidParameter;
+	return inAQTap->queue->processingTapGetQueueTime(inAQTap, outQueueSampleTime, outQueueFrameCount);
 }

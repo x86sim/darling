@@ -51,14 +51,57 @@ OSStatus OpaqueAudioQueue::getPropertySize(AudioQueuePropertyID inID, UInt32 *ou
 
 OSStatus OpaqueAudioQueue::addPropertyListener(AudioQueuePropertyID inID, AudioQueuePropertyListenerProc inProc, void *inUserData)
 {
-	STUB();
-	return unimpErr;
+	if (!inProc)
+		return paramErr;
+	std::lock_guard<std::mutex> lock(m_listenerMutex);
+	m_listeners.push_back({ inID, inProc, inUserData });
+	return noErr;
 }
 
 OSStatus OpaqueAudioQueue::removePropertyListener(AudioQueuePropertyID inID, AudioQueuePropertyListenerProc inProc, void *inUserData)
 {
-	STUB();
-	return unimpErr;
+	std::lock_guard<std::mutex> lock(m_listenerMutex);
+	for (auto it = m_listeners.begin(); it != m_listeners.end(); ++it)
+	{
+		if (it->id == inID && it->proc == inProc && it->userData == inUserData)
+		{
+			m_listeners.erase(it);
+			break;
+		}
+	}
+	return noErr;
+}
+
+void OpaqueAudioQueue::notifyListeners(AudioQueuePropertyID id)
+{
+	std::vector<Listener> listeners;
+	{
+		std::lock_guard<std::mutex> lock(m_listenerMutex);
+		for (const Listener& l : m_listeners)
+		{
+			if (l.id == id)
+				listeners.push_back(l);
+		}
+	}
+	if (listeners.empty())
+		return;
+	AudioQueueRef queue = this;
+	runOnClient([listeners, queue, id] {
+		for (const Listener& l : listeners)
+			l.proc(l.userData, queue, id);
+	});
+}
+
+OSStatus OpaqueAudioQueue::enqueueBufferWithParameters(AudioQueueBufferRef inBuffer, UInt32 inNumPacketDescs,
+		const AudioStreamPacketDescription *inPacketDescs, UInt32 inTrimFramesAtStart, UInt32 inTrimFramesAtEnd,
+		UInt32 inNumParamValues, const AudioQueueParameterEvent *inParamValues,
+		const AudioTimeStamp *inStartTime, AudioTimeStamp *outActualStartTime)
+{
+	// Trimming, scheduled start times and per-buffer parameters are not supported by default:
+	// accept the plain case only, rather than play something else than asked.
+	if (inTrimFramesAtStart || inTrimFramesAtEnd || inNumParamValues || inStartTime || outActualStartTime)
+		return unimpErr;
+	return enqueueBuffer(inBuffer, inNumPacketDescs, inPacketDescs);
 }
 
 OSStatus OpaqueAudioQueue::allocateBuffer(UInt32 inBufferByteSize, UInt32 inNumberPacketDescriptions, AudioQueueBufferRef *outBuffer)
@@ -80,6 +123,35 @@ OSStatus OpaqueAudioQueue::enqueueBuffer(AudioQueueBufferRef inBuffer, UInt32 in
 }
 
 OSStatus OpaqueAudioQueue::getCurrentTime(AudioTimeStamp *outTimeStamp, Boolean *outTimelineDiscontinuity)
+{
+	STUB();
+	return unimpErr;
+}
+
+OSStatus OpaqueAudioQueue::processingTapNew(AudioQueueProcessingTapCallback inCallback, void* inClientData,
+		AudioQueueProcessingTapFlags inFlags, UInt32* outMaxFrames,
+		AudioStreamBasicDescription* outProcessingFormat, AudioQueueProcessingTapRef* outAQTap)
+{
+	STUB();
+	return unimpErr;
+}
+
+OSStatus OpaqueAudioQueue::processingTapDispose(AudioQueueProcessingTapRef inAQTap)
+{
+	STUB();
+	return unimpErr;
+}
+
+OSStatus OpaqueAudioQueue::processingTapGetSourceAudio(AudioQueueProcessingTapRef inAQTap, UInt32 inNumberFrames,
+		AudioTimeStamp* ioTimeStamp, AudioQueueProcessingTapFlags* outFlags, UInt32* outNumberFrames,
+		AudioBufferList* ioData)
+{
+	STUB();
+	return unimpErr;
+}
+
+OSStatus OpaqueAudioQueue::processingTapGetQueueTime(AudioQueueProcessingTapRef inAQTap,
+		Float64* outQueueSampleTime, UInt32* outQueueFrameCount)
 {
 	STUB();
 	return unimpErr;
