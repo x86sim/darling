@@ -143,3 +143,35 @@ enum mldr_fat_result mldr_fat_select(const uint8_t* data, size_t len, uint64_t f
 
 	return MLDR_FAT_OK;
 }
+
+#define CPU_X86 7u
+#define CPU_X86_64 0x01000007u
+#define CPU_ARM64 0x0100000cu
+
+int mldr_macho_has_arch(const uint8_t* data, size_t len, uint64_t file_size, uint32_t cputype)
+{
+	struct mldr_fat_slice s;
+
+	if (data == NULL || len < 8)
+		return 0;
+	// thin 64-bit or 32-bit Mach-O (little-endian: every architecture we run)
+	if (rd32(data, 0) == 0xfeedfacfu || rd32(data, 0) == 0xfeedfaceu)
+		return rd32(data + 4, 0) == cputype;
+	return mldr_fat_select(data, len, file_size, NULL, cputype, 0, 0, &s) == MLDR_FAT_OK;
+}
+
+int mldr_runs_as_arm64(const uint8_t* exe, size_t exe_len, uint64_t exe_size, const uint32_t prefs[4],
+		int sim, const uint8_t* dyld_sim, size_t dyld_sim_len, uint64_t dyld_sim_size)
+{
+	struct mldr_fat_slice s;
+
+	if (!mldr_macho_has_arch(exe, exe_len, exe_size, CPU_ARM64))
+		return 0;
+	if (!mldr_macho_has_arch(exe, exe_len, exe_size, CPU_X86_64) && !mldr_macho_has_arch(exe, exe_len, exe_size, CPU_X86))
+		return 1;
+	// universal with both
+	if (sim && !mldr_macho_has_arch(dyld_sim, dyld_sim_len, dyld_sim_size, CPU_X86_64))
+		return 1;
+	return mldr_fat_select(exe, exe_len, exe_size, prefs, 0, CPU_X86_64, CPU_X86, &s) == MLDR_FAT_OK &&
+		s.cputype == CPU_ARM64;
+}

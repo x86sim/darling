@@ -154,5 +154,30 @@ int main(void)
 		check(s.offset == 0x1234 && s.size == 0x5678, "output untouched on error");
 	}
 
+	// which programs run under the arm64 translator (mldr_runs_as_arm64)
+	{
+		uint8_t thin_a64[8], thin_x64[8], fat[MLDR_FAT_MAX_HEADER + 64], fat_a64[MLDR_FAT_MAX_HEADER + 64];
+		put32(thin_a64, 0xfeedfacfu, 0); put32(thin_a64 + 4, ARM64, 0);
+		put32(thin_x64, 0xfeedfacfu, 0); put32(thin_x64 + 4, X86_64, 0);
+		const struct arch universal[] = { { X86_64, 3, 0x1000, 0x100 }, { ARM64, 0, 0x2000, 0x100 } };
+		const struct arch a64_armv7[] = { { 12, 9, 0x1000, 0x100 }, { ARM64, 0, 0x2000, 0x100 } };
+		size_t fn = build(fat, 1, 0, 2, universal, 2);
+		size_t an = build(fat_a64, 1, 0, 2, a64_armv7, 2);
+		const uint32_t pref_a64[4] = { ARM64, 0, 0, 0 };
+
+		check(mldr_runs_as_arm64(thin_a64, 8, 0x3000, nopref, 0, NULL, 0, 0), "thin arm64 runs as arm64");
+		check(!mldr_runs_as_arm64(thin_x64, 8, 0x3000, nopref, 1, thin_a64, 8, 0x3000), "thin x86_64 runs natively");
+		check(mldr_runs_as_arm64(fat_a64, an, 0x3000, nopref, 0, NULL, 0, 0), "arm64 + armv7 runs as arm64");
+		// issue 26: a universal app in the arm64-only iOS 27 runtime aborted in dyld (dyld_sim incompatible)
+		check(mldr_runs_as_arm64(fat, fn, 0x3000, nopref, 1, thin_a64, 8, 0x3000), "universal, arm64 runtime: arm64");
+		check(mldr_runs_as_arm64(fat, fn, 0x3000, nopref, 1, fat_a64, an, 0x3000), "universal, fat arm64-only dyld_sim: arm64");
+		check(mldr_runs_as_arm64(fat, fn, 0x3000, nopref, 1, NULL, 0, 0), "universal, unreadable dyld_sim: arm64");
+		check(!mldr_runs_as_arm64(fat, fn, 0x3000, nopref, 1, thin_x64, 8, 0x3000), "universal, x86_64 runtime: x86_64");
+		check(!mldr_runs_as_arm64(fat, fn, 0x3000, nopref, 1, fat, fn, 0x3000), "universal, universal runtime: x86_64");
+		check(mldr_runs_as_arm64(fat, fn, 0x3000, pref_a64, 1, fat, fn, 0x3000), "universal, universal runtime, arm64 binpref: arm64");
+		check(!mldr_runs_as_arm64(fat, fn, 0x3000, nopref, 0, NULL, 0, 0), "universal, not a simulator process: x86_64");
+		check(!mldr_runs_as_arm64(thin_a64, 4, 0x3000, nopref, 0, NULL, 0, 0), "truncated header: native");
+	}
+
 	return failures ? 1 : 0;
 }

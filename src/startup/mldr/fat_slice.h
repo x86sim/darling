@@ -68,4 +68,30 @@ enum mldr_fat_result mldr_fat_select(const uint8_t* data, size_t len, uint64_t f
 		const uint32_t prefs[4], uint32_t forced, uint32_t native, uint32_t fallback,
 		struct mldr_fat_slice* out);
 
+/**
+ * The CPU type a Mach-O file can run as: `cputype` if the file is a thin
+ * Mach-O of that type or a universal file with a usable slice of it (bounds
+ * checked like mldr_fat_select). `data` holds the first `len` bytes.
+ */
+int mldr_macho_has_arch(const uint8_t* data, size_t len, uint64_t file_size, uint32_t cputype);
+
+/**
+ * x86Sim: whether an x86_64 host runs a main executable as arm64 (under the
+ * arm64 translator) rather than natively. `exe` is the start of the executable.
+ * `sim` is nonzero for a simulator process (DYLD_ROOT_PATH is set); `dyld_sim`
+ * is then the start of the runtime's dyld_sim (NULL/0 if it could not be read).
+ *
+ * A file without an arm64 slice runs natively, one with arm64 and no x86
+ * slice as arm64. A universal file with both (an app built with
+ * ONLY_ACTIVE_ARCH=NO) runs as arm64 in a simulator process whose runtime
+ * cannot load x86_64 programs (dyld_sim has no x86_64 slice, or is unreadable:
+ * every runtime x86Sim ships is arm64-only), as Apple's simulator does on an
+ * arm64 Mac: its x86_64 slice would load an x86_64 dyld that refuses the arm64
+ * dyld_sim ("dyld_sim is not compatible with the loaded process", code 9).
+ * Otherwise (Darling's own programs, an x86_64-capable runtime) the binary
+ * preferences `prefs` (posix_spawnattr_setbinpref) pick, else x86_64.
+ */
+int mldr_runs_as_arm64(const uint8_t* exe, size_t exe_len, uint64_t exe_size, const uint32_t prefs[4],
+		int sim, const uint8_t* dyld_sim, size_t dyld_sim_len, uint64_t dyld_sim_size);
+
 #endif

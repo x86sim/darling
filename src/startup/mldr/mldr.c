@@ -228,43 +228,64 @@ static void reserve_sim_shared_region(char** argv, char** envp)
 
 #ifdef __x86_64__
 // x86Sim (arm64 plan, stage 1): Apple's arm64-only iOS-simulator binaries (iOS 27 runtime) run under a JIT. For an
-// arm64-only Mach-O, mldr re-executes itself on host/arm64host (an x86_64 macOS program installed next to mldr), which
-// starts like any Darling process and then runs the arm64 program in libarm64jit.so (dynarmic). DYLD_* variables are
-// renamed X86SIM_A64_DYLD_* so Darling's dyld doesn't act on them; libarm64jit gives them back to dyld_sim.
+// arm64 program (runs_as_arm64: arm64-only, or universal in an arm64-only simulator runtime), mldr re-executes itself
+// on host/arm64host (an x86_64 macOS program installed next to mldr), which starts like any Darling process and then
+// runs the arm64 program in libarm64jit.so (dynarmic). DYLD_* variables are renamed X86SIM_A64_DYLD_* so Darling's
+// dyld doesn't act on them; libarm64jit gives them back to dyld_sim.
 // X86SIM_A64_EXE is the arm64 program (Darwin path); libsystem_kernel keys simulator behaviour on it.
 #define X86SIM_A64_SYSTEM_ROOT "/Volumes/SystemRoot"
 
-static bool is_arm64_only(const char* path)
+// The first bytes of a file (enough for mldr_fat_select) and its size; 0 bytes if it cannot be read.
+static size_t read_head(const char* path, uint8_t* buf, size_t len, uint64_t* size)
 {
-	uint32_t buf[2 + 5 * 16];
+	struct stat st;
 	int fd = open(path, O_RDONLY | O_CLOEXEC);
+	*size = 0;
 	if (fd < 0)
-		return false;
-	ssize_t n = read(fd, buf, sizeof(buf));
+		return 0;
+	ssize_t n = fstat(fd, &st) == 0 ? pread(fd, buf, len, 0) : -1;
 	close(fd);
-	if (n < 8)
+	if (n <= 0)
+		return 0;
+	*size = (uint64_t) st.st_size;
+	return (size_t) n;
+}
+
+// Whether to run the program under the arm64 translator: an arm64-only Mach-O, or a universal one with an x86_64
+// slice too in a simulator process whose runtime is arm64-only (mldr_runs_as_arm64). DYLD_ROOT_PATH (a Darwin path;
+// X86SIM_A64_DYLD_ROOT_PATH where an arm64 parent's environment was passed on as is) marks a simulator process.
+static bool runs_as_arm64(const char* path, char** envp, const struct load_results* lr)
+{
+	static uint8_t exe[MLDR_FAT_MAX_HEADER], dyld_sim[MLDR_FAT_MAX_HEADER];
+	static char dyld_sim_path[8192];
+	uint64_t exe_size, dyld_sim_size = 0;
+	size_t exe_len = read_head(path, exe, sizeof(exe), &exe_size), dyld_sim_len = 0;
+	const char* root = NULL;
+
+	if (exe_len < 8)
 		return false;
-	if (buf[0] == MH_MAGIC_64)
-		return buf[1] == CPU_TYPE_ARM64;
-	if (buf[0] == FAT_CIGAM) {
-		uint32_t count = be32toh(buf[1]);
-		bool arm64 = false;
-		for (uint32_t i = 0; i < count && i < 16 && (ssize_t)((2 + 5 * (i + 1)) * 4) <= n; i++) {
-			uint32_t cpu = be32toh(buf[2 + 5 * i]);
-			if (cpu == CPU_TYPE_X86_64 || cpu == CPU_TYPE_X86)
-				return false;
-			if (cpu == CPU_TYPE_ARM64)
-				arm64 = true;
-		}
-		return arm64;
+	for (char** e = envp; *e != NULL; ++e) {
+		if (strncmp(*e, "DYLD_ROOT_PATH=", sizeof("DYLD_ROOT_PATH=") - 1) == 0)
+			root = *e + sizeof("DYLD_ROOT_PATH=") - 1;
+		else if (root == NULL && strncmp(*e, "X86SIM_A64_DYLD_ROOT_PATH=", sizeof("X86SIM_A64_DYLD_ROOT_PATH=") - 1) == 0)
+			root = *e + sizeof("X86SIM_A64_DYLD_ROOT_PATH=") - 1;
 	}
-	return false;
+	if (root != NULL && *root != '\0') {
+		// the runtime's dyld_sim as a Linux path (as arm64_host_setup maps X86SIM_A64_EXE)
+		if (strncmp(root, X86SIM_A64_SYSTEM_ROOT "/", sizeof(X86SIM_A64_SYSTEM_ROOT)) == 0)
+			snprintf(dyld_sim_path, sizeof(dyld_sim_path), "%s/usr/lib/dyld_sim", root + sizeof(X86SIM_A64_SYSTEM_ROOT) - 1);
+		else
+			snprintf(dyld_sim_path, sizeof(dyld_sim_path), "%s%s/usr/lib/dyld_sim", lr->root_path ? lr->root_path : "", root);
+		dyld_sim_len = read_head(dyld_sim_path, dyld_sim, sizeof(dyld_sim), &dyld_sim_size);
+	}
+	return mldr_runs_as_arm64(exe, exe_len, exe_size, lr->bprefs, root != NULL && *root != '\0',
+		dyld_sim_len ? dyld_sim : NULL, dyld_sim_len, dyld_sim_size);
 }
 
 static void arm64_reexec(const char* filename, char** argv, char** envp, struct load_results* lr)
 {
 	static char self[4096], host[4200], jit[4200], darwin_path[8192];
-	if (!is_arm64_only(filename))
+	if (!runs_as_arm64(filename, envp, lr))
 		return;
 	ssize_t len = readlink("/proc/self/exe", self, sizeof(self) - 1);
 	if (len <= 0) {
