@@ -27,8 +27,12 @@
 #include <HIToolbox/CarbonEventsCore.h>
 #include <HIToolbox/CarbonEvents.h>
 #include "HIToolboxInternal.h"
+#include "MenusInternal.h"
 #include "HIToolboxPrivate.h"
 #include <CarbonCore/MacErrors.h>
+#include <AE/AE.h>
+#include <HIServices/Processes.h>
+#include <unistd.h>
 
 #include <stdlib.h>
 #include <string.h>
@@ -262,6 +266,52 @@ OSStatus _HIReceiveNextEventMatching(HIEventMatchProc match, void* info, CFStrin
 	return waitForEvent(match, info, false, runLoopMode, timeout, pull, outEvent);
 }
 
+// One run of the run loop between two looks at the queue (kHIReceiveNextEventSinglePass)
+static OSStatus waitOnce(Boolean (*match)(EventRef, void*), void* info, bool pure, CFStringRef mode, EventTimeout timeout, Boolean pull, EventRef* outEvent)
+{
+	struct OpaqueEventLoopRef* loop = _HIEventLoopForCurrentThread();
+
+	if (!mode)
+		mode = kCFRunLoopDefaultMode;
+	else if (!CFEqual(mode, kCFRunLoopDefaultMode))
+		CFRunLoopAddSource(loop->runLoop, loop->wakeSource, mode);
+	_HIEventStreamWillWait(loop, mode);
+
+	*outEvent = NULL;
+
+	// The run loop runs even when an event is waiting, without blocking then, so that its timers
+	// and sources are not held up by a stream of events
+	_HIRunEventPollProcs(&loop->queue);
+	bool waiting = _HIQueueTakeMatching(&loop->queue, match, info, pure, false) != NULL;
+	CFTimeInterval limit = 0;
+	if (!waiting && !atomic_load(&loop->quitRequested))
+		limit = timeout < 0 ? 1e9 : timeout;
+	CFRunLoopRunInMode(mode, limit, true);
+
+	_HIRunEventPollProcs(&loop->queue);
+	EventRef event = _HIQueueTakeMatching(&loop->queue, match, info, pure, pull);
+	if (event)
+	{
+		*outEvent = event;
+		return noErr;
+	}
+	if (atomic_exchange(&loop->quitRequested, false))
+		return eventLoopQuitErr;
+	return eventLoopTimedOutErr;
+}
+
+OSStatus _HIReceiveNextEventMatchingWithOptions(HIEventMatchProc match, void* info, CFStringRef runLoopMode, EventTimeout timeout, OptionBits options, EventRef* outEvent)
+{
+	if (!outEvent)
+		return paramErr;
+
+	bool pure = (options & kHIReceiveNextEventFilterIsPure) != 0;
+	Boolean pull = (options & kHIReceiveNextEventPull) != 0;
+	if (options & kHIReceiveNextEventSinglePass)
+		return waitOnce(match, info, pure, runLoopMode, timeout, pull, outEvent);
+	return waitForEvent(match, info, pure, runLoopMode, timeout, pull, outEvent);
+}
+
 OSStatus ReceiveNextEvent(ItemCount inNumTypes, const EventTypeSpec* inList, EventTimeout inTimeout, Boolean inPullEvent, EventRef* outEvent)
 {
 	if (!outEvent || (inNumTypes != 0 && !inList))
@@ -291,20 +341,147 @@ void QuitApplicationEventLoop(void)
 	QuitEventLoop(_HIMainEventLoop());
 }
 
+// The quit command: the standard application handler hands it to the quit Apple event, which an
+// application that handles it receives (Carbon Event Manager documentation: "the standard application
+// event handler calls the default Quit Apple event handler"). The default handler ends the application
+// event loop.
+void _HIQuitApplication(void)
+{
+	AEDesc target;
+	AppleEvent event;
+	SInt32 pid = (SInt32) getpid();
+	OSStatus status = AECreateDesc(typeKernelProcessID, &pid, sizeof(pid), &target);
+
+	if (status == noErr)
+	{
+		status = AECreateAppleEvent(kCoreEventClass, kAEQuitApplication, &target, kAutoGenerateReturnID, kAnyTransactionID, &event);
+		AEDisposeDesc(&target);
+	}
+	if (status == noErr)
+	{
+		status = AESendMessage(&event, NULL, kAENoReply, kAEDefaultTimeout);
+		AEDisposeDesc(&event);
+	}
+	if (status != noErr)
+		QuitApplicationEventLoop();
+}
+
+// The processes other than this one that can be hidden and shown: the applications of the Process Manager
+static void forEachOtherProcess(void (^action)(const ProcessSerialNumber* psn))
+{
+	ProcessSerialNumber self, psn = { 0, kNoProcess };
+
+	GetCurrentProcess(&self);
+	while (GetNextProcess(&psn) == noErr)
+	{
+		Boolean same = false;
+
+		SameProcess(&psn, &self, &same);
+		if (!same)
+			action(&psn);
+	}
+}
+
+// What the standard application handler does with the system's commands of the menus. Returns whether it
+// handled the command.
+static OSStatus standardCommand(const HICommand* command, bool update)
+{
+	switch (command->commandID)
+	{
+		case kHICommandMinimizeWindow:
+		case kHICommandMinimizeAll:
+		case kHICommandZoomWindow:
+		case kHICommandBringAllToFront:
+		case kHICommandArrangeInFront:
+		case kHICommandRotateWindowsForward:
+		case kHICommandRotateWindowsBackward:
+			if (update)
+			{
+				if (command->menu.menuRef)
+				{
+					if (_HIWindowCommandEnabled(command->commandID))
+						EnableMenuItem(command->menu.menuRef, command->menu.menuItemIndex);
+					else
+						DisableMenuItem(command->menu.menuRef, command->menu.menuItemIndex);
+				}
+				return noErr;
+			}
+			return _HIWindowCommand(command->commandID, NULL);
+		case kHICommandSelectWindow:
+		{
+			WindowRef window = NULL;
+			ByteCount actual = 0;
+
+			if (update)
+			{
+				if (command->menu.menuRef)
+					EnableMenuItem(command->menu.menuRef, command->menu.menuItemIndex);
+				return noErr;
+			}
+			if (!command->menu.menuRef ||
+				GetMenuItemProperty(command->menu.menuRef, command->menu.menuItemIndex, 'dlng', 'wind', sizeof(window), &actual, &window) != noErr ||
+				!IsValidWindowPtr(window))
+				return eventNotHandledErr;
+			return _HIWindowCommand(command->commandID, window);
+		}
+		case kHICommandHide:
+		case kHICommandHideOthers:
+		case kHICommandShowAll:
+		{
+			ProcessSerialNumber self;
+
+			if (update)
+				return noErr;
+			if (command->commandID == kHICommandHide)
+			{
+				GetCurrentProcess(&self);
+				ShowHideProcess(&self, false);
+			}
+			else
+			{
+				Boolean show = command->commandID == kHICommandShowAll;
+
+				forEachOtherProcess(^(const ProcessSerialNumber* psn) {
+					if (show != IsProcessVisible(psn))
+						ShowHideProcess(psn, show);
+				});
+			}
+			return noErr;
+		}
+	}
+	return eventNotHandledErr;
+}
+
 OSStatus _HIStandardApplicationHandler(EventHandlerCallRef call, EventRef event, void* userData)
 {
 	HICommand command;
 
-	if (event->eventClass != kEventClassCommand || event->kind != kEventCommandProcess)
+	// Command-key equivalents of the menu bar and a click in the menu bar window, which no
+	// handler of the application took
+	if (event->eventClass == kEventClassKeyboard && (event->kind == kEventRawKeyDown || event->kind == kEventRawKeyRepeat))
+		return _HIHandleKeyEquivalent(event);
+	if (event->eventClass == kEventClassMouse && event->kind == kEventMouseDown)
+		return _HIHandleMenuBarMouseDown(event);
+	if (event->eventClass != kEventClassCommand || (event->kind != kEventCommandProcess && event->kind != kEventCommandUpdateStatus))
 		return eventNotHandledErr;
 	if (GetEventParameter(event, kEventParamDirectObject, typeHICommand, NULL, sizeof(command), NULL, &command) != noErr)
 		return eventNotHandledErr;
-	// Quit ends the loop of an application that runs one; any other application decides
-	// what quitting means.
-	if (command.commandID != kHICommandQuit || atomic_load(&g_applicationLoopsRunning) == 0)
+	if (command.commandID != kHICommandQuit)
+		return standardCommand(&command, event->kind == kEventCommandUpdateStatus);
+	if (event->kind == kEventCommandUpdateStatus)
 		return eventNotHandledErr;
 
-	QuitApplicationEventLoop();
+	// Quit goes to the quit Apple event; an application that has no handler for it and runs an application
+	// event loop ends that loop, any other application decides what quitting means.
+	if (atomic_load(&g_applicationLoopsRunning) == 0)
+	{
+		AEEventHandlerUPP handler;
+		SRefCon refcon;
+
+		if (AEGetEventHandler(kCoreEventClass, kAEQuitApplication, &handler, &refcon, false) != noErr)
+			return eventNotHandledErr;
+	}
+	_HIQuitApplication();
 	return noErr;
 }
 

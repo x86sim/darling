@@ -570,29 +570,63 @@ static EGLBoolean choose_registered_config(EGLDisplay dpy, EGLConfig *out_config
 // display, such as an offscreen renderer, gets EGL's default display, whose
 // platform EGL picks, or a surfaceless display if that cannot be opened.
 // Its contexts render into pbuffers or framebuffer objects.
+//
+// What the default display is depends on the process' environment: in a
+// session with a window system (DISPLAY or WAYLAND_DISPLAY set) EGL's default
+// platform is that window system, and on a host whose GPU the window system's
+// Mesa cannot drive (an X server or compositor on the NVIDIA driver) the
+// default display is Mesa's software rasterizer, although the GPU is there and
+// the surfaceless platform reaches it. A hardware display is therefore
+// preferred: a display on a software device is only taken when no candidate
+// is a hardware one. A context that needs window surfaces (a fullscreen
+// pixel format) cannot use a surfaceless display; it keeps the first display
+// that opens, the window system's.
 static EGLDisplay default_display = EGL_NO_DISPLAY;
 static EGLConfig default_config;
+static EGLDisplay window_display = EGL_NO_DISPLAY;
+static EGLConfig window_config;
+
+static int softwareEGLDevice(EGLDisplay display);
 
 static void open_default_display(void) {
     EGLDisplay candidates[] = {
         p_eglGetDisplay(EGL_DEFAULT_DISPLAY),
         p_eglGetPlatformDisplay(EGL_PLATFORM_SURFACELESS_MESA, EGL_DEFAULT_DISPLAY, NULL),
     };
+    EGLDisplay software_display = EGL_NO_DISPLAY;
+    EGLConfig software_config = NULL;
     for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++) {
         EGLConfig candidate_config;
         if (candidates[i] == EGL_NO_DISPLAY || !p_eglInitialize(candidates[i], NULL, NULL))
             continue;
         if (!choose_config(candidates[i], EGL_PBUFFER_BIT, 0, &candidate_config, NULL))
             continue;
+        if (window_display == EGL_NO_DISPLAY) {
+            window_display = candidates[i];
+            window_config = candidate_config;
+        }
+        if (softwareEGLDevice(candidates[i])) {
+            if (software_display == EGL_NO_DISPLAY) {
+                software_display = candidates[i];
+                software_config = candidate_config;
+            }
+            continue;
+        }
         default_display = candidates[i];
         default_config = candidate_config;
         return;
     }
+    default_display = software_display;
+    default_config = software_config;
 }
 
-static EGLDisplay get_default_display(EGLConfig *out_config) {
+static EGLDisplay get_default_display(EGLConfig *out_config, int needs_windows) {
     static pthread_once_t once = PTHREAD_ONCE_INIT;
     pthread_once(&once, open_default_display);
+    if (needs_windows && window_display != EGL_NO_DISPLAY) {
+        *out_config = window_config;
+        return window_display;
+    }
     *out_config = default_config;
     return default_display;
 }
@@ -642,6 +676,14 @@ struct _CGLContextObject {
     CGSConnectionID fullscreen_connection;
     CGSWindowID fullscreen_window;
     EGLSurface fullscreen_surface;
+    // The ids CGLSetSurface was given for the drawable, with the EGL surface it
+    // made from them. They describe the drawable only while egl_surface is still
+    // that surface (any other way of attaching or clearing the drawable changes
+    // it). Guarded by lock.
+    EGLSurface set_surface;
+    CGSConnectionID set_surface_connection;
+    CGSWindowID set_surface_window;
+    CGSSurfaceID set_surface_id;
     // EGL has no function for getting the current swap interval,
     // so we need to save the last set value. The default is 0.
     // This is the application's value; a paced context never gives it to EGL.
@@ -883,7 +925,13 @@ CGLError CGLSetSurface(CGLContextObj gl, CGSConnectionID cid, CGSWindowID wid, C
         return kCGLBadWindow;
 
     EGLSurface surf = p_eglCreateWindowSurface(gl->egl_display, gl->egl_config, window, NULL);
+    pthread_mutex_lock(&gl->lock);
     atomic_store_explicit(&gl->egl_surface, surf, memory_order_release);
+    gl->set_surface = surf;
+    gl->set_surface_connection = cid;
+    gl->set_surface_window = wid;
+    gl->set_surface_id = sid;
+    pthread_mutex_unlock(&gl->lock);
     if (surf == EGL_NO_SURFACE)
         return kCGLBadState;
     return kCGLNoError;
@@ -1042,6 +1090,67 @@ CGL_EXPORT void CGLDestroyWindow(CGLWindowRef ref) {
     pthread_mutex_unlock(&g_windowsMutex);
     p_eglDestroySurface(window->display, window->surface);
     free(window);
+}
+
+// The native window handle that the context's current EGL surface was made
+// for, when that surface belongs to a CGLWindowRef; NULL otherwise.
+static void *nativeWindowOfSurface(EGLSurface surface) {
+    void *native = NULL;
+    pthread_mutex_lock(&g_windowsMutex);
+    for (struct _CGLWindow *window = g_windows; window != NULL; window = window->next) {
+        if (window->surface == surface) {
+            native = window->native_window;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_windowsMutex);
+    return native;
+}
+
+// The window server ids of the context's drawable: those it was given with
+// CGLSetSurface, or those of the AppKit view's window surface for a context
+// attached to one through its CGLWindowRef (CoreGraphics keeps that
+// registry). A context with no drawable of either kind reports zeros and no
+// error.
+//
+// QUIRK: the ids of a context without a drawable are 0, 0, 0 and the call
+// succeeds. Not documented. Evidence: black-box observation on macOS 26.7.3
+// (tier 2). A NULL context gives kCGLBadContext and leaves the outputs
+// untouched. Test: cgl_get_surface (cgl_get_surface_no_drawable and
+// cgl_get_surface_null_context checks).
+CGLError CGLGetSurface(CGLContextObj gl, CGSConnectionID *cid, CGSWindowID *wid, CGSSurfaceID *sid)
+{
+    if (!gl)
+        return kCGLBadContext;
+
+    CGSConnectionID connection = 0;
+    CGSWindowID window = 0;
+    CGSSurfaceID surface = 0;
+
+    EGLSurface current = atomic_load_explicit(&gl->egl_surface, memory_order_acquire);
+    if (current != EGL_NO_SURFACE) {
+        pthread_mutex_lock(&gl->lock);
+        int set_here = gl->set_surface == current;
+        if (set_here) {
+            connection = gl->set_surface_connection;
+            window = gl->set_surface_window;
+            surface = gl->set_surface_id;
+        }
+        pthread_mutex_unlock(&gl->lock);
+        if (!set_here) {
+            void *native = nativeWindowOfSurface(current);
+            if (native != NULL)
+                _CGSWindowSurfaceForNativeWindow(native, &connection, &window, &surface);
+        }
+    }
+
+    if (cid)
+        *cid = connection;
+    if (wid)
+        *wid = window;
+    if (sid)
+        *sid = surface;
+    return kCGLNoError;
 }
 
 CGL_EXPORT CGLError CGLContextMakeCurrentAndAttachToWindow(CGLContextObj context, CGLWindowRef window) {
@@ -1986,7 +2095,10 @@ static CGLError createContext(CGLPixelFormatObj pixelFormat, CGLContextObj share
         owner_config = window->config;
     }
     if (owner == EGL_NO_DISPLAY) {
-        owner = get_default_display(&owner_config);
+        GLint fullscreen = 0;
+        int needs_windows = pixelFormat
+            && CGLDescribePixelFormat(pixelFormat, 0, kCGLPFAFullScreen, &fullscreen) == kCGLNoError && fullscreen;
+        owner = get_default_display(&owner_config, needs_windows);
         if (owner == EGL_NO_DISPLAY)
             return kCGLBadConnection;
     }
@@ -2050,6 +2162,7 @@ static CGLError createContext(CGLPixelFormatObj pixelFormat, CGLContextObj share
     context->fullscreen_connection = 0;
     context->fullscreen_window = 0;
     context->fullscreen_surface = EGL_NO_SURFACE;
+    context->set_surface = EGL_NO_SURFACE;
     context->swap_interval = interval;
     context->paced = paced;
     context->pacer.period_ns = cgl_period_ns_from_millihertz(0);
@@ -4696,6 +4809,8 @@ struct cgl_renderer {
     uint64_t video_memory;
     GLint max_samples;
     GLint gl_major;
+    // the IORegistry entry ID of the renderer's GPU (0 for none)
+    uint64_t registry_id;
 };
 
 struct _CGLRendererInfoObj {
@@ -4755,6 +4870,33 @@ static uint64_t registryVideoMegabytes(void) {
     return megabytes;
 }
 
+// The IORegistry entry ID of the GPU: the IOAccelerator service that registryVideoMegabytes() takes
+// its figure from (the first one with a figure, else the first one). 0 if the registry has none.
+static uint64_t registryAcceleratorID(void) {
+    io_iterator_t iterator = IO_OBJECT_NULL;
+    if (IOServiceGetMatchingServices(kIOMasterPortDefault, IOServiceMatching("IOAccelerator"), &iterator) != KERN_SUCCESS)
+        return 0;
+    uint64_t first = 0, withFigure = 0;
+    CFStringRef key = CFStringCreateWithCString(NULL, "VRAM,totalMB", kCFStringEncodingUTF8);
+    io_registry_entry_t service;
+    while (withFigure == 0 && (service = IOIteratorNext(iterator)) != IO_OBJECT_NULL) {
+        uint64_t id = 0;
+        if (IORegistryEntryGetRegistryEntryID(service, &id) == KERN_SUCCESS) {
+            if (first == 0)
+                first = id;
+            CFTypeRef value = IORegistryEntryCreateCFProperty(service, key, NULL, 0);
+            if (value) {
+                withFigure = id;
+                CFRelease(value);
+            }
+        }
+        IOObjectRelease(service);
+    }
+    CFRelease(key);
+    IOObjectRelease(iterator);
+    return withFigure ? withFigure : first;
+}
+
 // Describes the renderer of the context that is current, which has the given display.
 static void describeCurrentRenderer(EGLDisplay egl_display, struct cgl_renderer *out) {
     const char *vendor = (const char *) host_glGetString(GL_VENDOR);
@@ -4795,6 +4937,7 @@ static void describeCurrentRenderer(EGLDisplay egl_display, struct cgl_renderer 
     out->video_memory = video_memory;
     out->max_samples = max_samples > 0 ? max_samples : 0;
     out->gl_major = major;
+    out->registry_id = accelerated ? registryAcceleratorID() : 0;
 }
 
 // Makes a context just to ask it, and puts back whatever was current. The answer for a display is kept:
@@ -4862,6 +5005,7 @@ CGLError CGLQueryRendererInfo(GLuint display_mask, CGLRendererInfoObj *rend, GLi
     info->renderers[1].video_memory = 0;
     info->renderers[1].max_samples = 0;
     info->renderers[1].gl_major = info->renderers[0].gl_major;
+    info->renderers[1].registry_id = 0;
     info->count = 2;
     // the renderer draws to whichever of the requested displays there are
     info->display_mask = display_mask;
@@ -4914,6 +5058,17 @@ CGLError CGLDescribeRenderer(CGLRendererInfoObj rend, GLint rend_num, CGLRendere
     case kCGLRPMaxSampleBuffers: *value = renderer->max_samples > 0; break;
     case kCGLRPMaxSamples: *value = renderer->max_samples; break;
     case kCGLRPMajorGLVersion: *value = renderer->gl_major; break;
+    case kCGLRPRegistryIDLow:
+    case kCGLRPRegistryIDHigh:
+        // The halves of the GPU's 64-bit IORegistry entry ID, as GLints. A renderer without a GPU
+        // (the software one) has no ID, and the property is refused for it; this is Darling's
+        // choice, not observed on macOS.
+        if (renderer->registry_id == 0) {
+            *value = 0;
+            return kCGLBadProperty;
+        }
+        *value = (GLint) (uint32_t) (prop == kCGLRPRegistryIDLow ? renderer->registry_id : renderer->registry_id >> 32);
+        break;
     default:
         *value = 0;
         return kCGLBadProperty;
