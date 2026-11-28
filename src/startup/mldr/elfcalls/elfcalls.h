@@ -90,10 +90,6 @@ struct elf_calls
 	// with a newer mldr still finds it)
 	int (*inherited_nofile_limit)(unsigned int limits[2]);
 
-	// First thing in a fork's child that does not go through the host libc:
-	// reinitialize mldr's locks before the child closes the parent's descriptors
-	// through the socket bitmap.
-	void (*postfork_child)(void);
 };
 
 #endif
