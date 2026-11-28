@@ -8,8 +8,8 @@
 // DirectBitsRect and DirectBitsRgn (1-8 bit indexed with a color table, 16 and 32 bit direct;
 // the region of the *Rgn forms is skipped), and the QuickTime opcodes CompressedQuickTime and
 // UncompressedQuickTime for images that ImageIO decodes (TIFF, JPEG, PNG, GIF, BMP; the matrix
-// is taken as the identity, the matte and the mask are skipped). Text opcodes are skipped and counted, since this
-// QuickDraw draws no text. Any other opcode stops the playback with QDError set to
+// is taken as the identity, the matte and the mask are skipped). Text opcodes are skipped (playback draws no
+// text). Any other opcode stops the playback with QDError set to
 // pictureDataErr; what was drawn before it stays drawn. Version 1 pictures are refused.
 // Reference: Imaging With QuickDraw, Appendix A.
 #ifndef __LP64__
@@ -26,8 +26,7 @@
 
 enum { kQDPictUnsupportedOpcode = -11005 /* pictureDataErr */ };
 
-typedef struct { SInt16 picSize; Rect picFrame; } QDPicture;
-typedef QDPicture **QDPicHandle;
+typedef PicHandle QDPicHandle;
 
 void PenSize(short, short);
 void PenMode(short);
@@ -45,6 +44,9 @@ void TextFont(short);
 void TextSize(short);
 void TextMode(short);
 void TextFace(StyleParameter);
+
+// While a picture is measured (_QDPictureGetPixelDepth) the deepest pixel map that it holds is noted
+static __thread short gMeasuredDepth;
 
 struct reader { const uint8_t *p, *end; Boolean bad; };
 
@@ -131,6 +133,8 @@ static Boolean pixels(struct reader *r, unsigned op, struct QDPort *port, const 
 			}
 		}
 	}
+	if (pixelSize > gMeasuredDepth)
+		gMeasuredDepth = (short) pixelSize;
 	Rect src = rect(r), dst = rect(r);
 	u16(r); // transfer mode: the picture is copied
 	if (op == 0x99 || op == 0x9B) skip(r, u16(r) - 2); // mask region
@@ -256,7 +260,7 @@ static Boolean quicktime_image(struct reader *r, struct QDPort *port, const stru
 	return ok;
 }
 
-static QDErr play(const uint8_t *data, size_t size, const Rect *dstRect, unsigned *skippedText)
+static QDErr play(const uint8_t *data, size_t size, const Rect *dstRect)
 {
 	struct QDPort *port = PORT_FROM(gCurrentPort);
 	if (!port || !QDPortIsLive(port)) return paramErr;
@@ -298,9 +302,9 @@ static QDErr play(const uint8_t *data, size_t size, const Rect *dstRect, unsigne
 			case 0x0032: { Rect x = map_rect(&m, rect(&r)); EraseRect(&x); break; }
 			case 0x0033: { Rect x = map_rect(&m, rect(&r)); InvertRect(&x); break; }
 			case 0x0034: { Rect x = map_rect(&m, rect(&r)); FillRect(&x, &fill); break; }
-			case 0x0028: skip(&r, 4); skip(&r, u8(&r)); ++*skippedText; break;  // LongText
-			case 0x0029: case 0x002A: skip(&r, 1); skip(&r, u8(&r)); ++*skippedText; break; // DHText, DVText
-			case 0x002B: skip(&r, 2); skip(&r, u8(&r)); ++*skippedText; break;  // DHDVText
+			case 0x0028: skip(&r, 4); skip(&r, u8(&r)); break;  // LongText
+			case 0x0029: case 0x002A: skip(&r, 1); skip(&r, u8(&r)); break; // DHText, DVText
+			case 0x002B: skip(&r, 2); skip(&r, u8(&r)); break;  // DHDVText
 			case 0x002C: { unsigned n = u16(&r); skip(&r, n); break; }        // fontName
 			case 0x00A0: skip(&r, 2); break;                                  // ShortComment
 			case 0x00A1: { skip(&r, 2); unsigned n = u16(&r); skip(&r, n); break; } // LongComment
@@ -317,22 +321,57 @@ static QDErr play(const uint8_t *data, size_t size, const Rect *dstRect, unsigne
 	return kQDPictUnsupportedOpcode;
 }
 
-static unsigned gLastSkippedText;
-
-// Text opcodes skipped by the last DrawPicture (diagnostic accessor, private).
-unsigned QDLastPictureSkippedText(void) { return gLastSkippedText; }
-
-QDPicHandle GetPicture(short pictureID)
+PicHandle GetPicture(short pictureID)
 {
-	return (QDPicHandle) GetResource('PICT', pictureID);
+	return (PicHandle) GetResource('PICT', pictureID);
 }
 
-void DrawPicture(QDPicHandle pic, const Rect *dstRect)
+void DrawPicture(PicHandle pic, const Rect *dstRect)
 {
-	gLastSkippedText = 0;
 	if (!pic || !*pic || !dstRect) { gQDError = paramErr; return; }
 	Size size = GetHandleSize((Handle) pic);
-	gQDError = play((const uint8_t *) *pic, (size_t) size, dstRect, &gLastSkippedText);
+	gQDError = play((const uint8_t *) *pic, (size_t) size, dstRect);
+}
+
+// OpenCPicture / ClosePicture: recording of the drawing done in the current port (QDRecord.inc in QDDrawing.c).
+PicHandle OpenCPicture(const OpenCPicParams *params)
+{
+	if (!params) { gQDError = paramErr; return NULL; }
+	if (params->version != -2) { gQDError = paramErr; return NULL; }   // the extended version 2 header is the only form
+	return (PicHandle) QDRecordOpen(&params->srcRect, params->hRes, params->vRes, params->version);
+}
+
+void ClosePicture(void)
+{
+	QDRecordClose();
+}
+
+
+// Not an Apple API, and exported on purpose: the pixel depth of the deepest pixel map (bit map: 1) that a picture
+// draws, for the graphics importer of picture files, which reports it in its image description. 0 for a picture
+// with no pixel maps (it only draws shapes), or one that cannot be played.
+short _QDPictureGetPixelDepth(QDPicHandle pic)
+{
+	if (!pic || !*pic)
+		return 0;
+	Rect frame = (*pic)->picFrame;
+	short width = frame.right - frame.left, height = frame.bottom - frame.top;
+	if (width <= 0 || height <= 0 || width > 4096 || height > 4096)
+		return 0;
+	GWorldPtr scratch = NULL;
+	Rect bounds = { 0, 0, height, width };
+	if (NewGWorld(&scratch, 32, &bounds, NULL, NULL, 0) != noErr)
+		return 0;
+	GrafPtr saved = gCurrentPort;
+	QDErr savedError = gQDError;
+	gCurrentPort = (GrafPtr) scratch;
+	gMeasuredDepth = 0;
+	play((const uint8_t *) *pic, (size_t) GetHandleSize((Handle) pic), &bounds);
+	short depth = gMeasuredDepth;
+	gCurrentPort = saved;
+	gQDError = savedError;
+	DisposeGWorld(scratch);
+	return depth;
 }
 
 #endif /* !__LP64__ */

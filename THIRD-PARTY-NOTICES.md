@@ -29,6 +29,19 @@ that is part of this repository itself and not under the GNU GPL 3.0 is listed h
   bundle in the prefix; DiskImageMounter's images are also installed on the host in the hicolor icon
   theme as `org.darlinghq.Darling.DiskImageMounter.png`.
 
+## Adwaita icon theme, `src/external/cocotron/AppKit/SystemSymbols` and `SystemImages`
+
+- Copyright the GNOME Project, <https://www.gnome.org>.
+- Source: adwaita-icon-theme, <https://gitlab.gnome.org/GNOME/adwaita-icon-theme>. The 54 SVG files
+  in `SystemSymbols` are unmodified copies of its symbolic icons; the PNG files in `SystemImages` are
+  icons of it rendered with `rsvg-convert` (the versions are listed in its `COPYING.Adwaita`).
+- Licence: GNU LGPL version 3, or Creative Commons Attribution-Share Alike 3.0 United States
+  (`COPYING.Adwaita` in each of the two directories).
+- Use: AppKit draws the system symbols (`NSImage` with a symbol name) that have no drawing of their
+  own from the SVG files, and uses the PNG files as the standard system images (folder, computer,
+  trash, generic document icons and so on). Both are installed in the AppKit framework resources
+  together with their `COPYING.Adwaita`.
+
 ## ASTC reference vectors, `src/libtexturecodec/tests/vectors` and `vectors-random`
 
 - What: test data that is output of the astcenc 5.7.1 release binary
@@ -66,3 +79,11 @@ darling-swift.
   distributions to include its notice; the full text is quoted in `overlays/CryptoKit/NOTICE.md`.
 - Use: linked into the built `CryptoKit.framework`. Whether the licence texts and `NOTICE.txt` are installed with
   the framework, as the Helvetica Neue entry above does, is an open question for the maintainers.
+
+## PipeWire and libspa headers, host/runtime dependencies of optional PipeWire backend
+
+- What: The optional PipeWire camera/audio/screen-capture backend links at build/runtime against host-installed PipeWire/libspa libraries and uses their public headers during compilation (`libpipewire-0.3`, `spa-0.2`). No PipeWire/libspa source code is vendored in this repository.
+- Upstream: PipeWire, <https://gitlab.freedesktop.org/pipewire/pipewire>.
+- Licence: PipeWire is distributed under the MIT license; libspa headers/code in PipeWire are also MIT-licensed. Exact installed versions and license texts are provided by the host distribution packages used to build/run the backend.
+- Use: Optional backend integration only. Builds without PipeWire development/runtime libraries disable this backend. Distributions packaging Darling with PipeWire enabled should include the corresponding PipeWire/libspa copyright and license notices from their packages.
+- HDR note: HDR screen/camera capture negotiates PipeWire raw video formats/colorimetry (e.g. P010/PQ/BT2020) only when supported by the linked runtime (PipeWire >= 1.6 gate in code). No PipeWire source is vendored; behavior depends on host PipeWire/libspa and compositor/portal capabilities.

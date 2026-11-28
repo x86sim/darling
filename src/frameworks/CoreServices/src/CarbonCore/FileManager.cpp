@@ -18,6 +18,7 @@ along with Darling.  If not, see <http://www.gnu.org/licenses/>.
 */
 
 #include <CoreServices/FileManager.h>
+#include <CarbonCore/Folders.h>
 #include <cstdlib>
 #include <string>
 #include <cstring>
@@ -55,7 +56,7 @@ static bool hasgid(gid_t gid);
 
 #if !__LP64__
 // Fills in the FSSpec of an item (the volume, the directory that holds it and its name)
-static void fsSpecForPath(const std::string& path, FSSpec* spec);
+static OSErr fsSpecForPath(const std::string& path, FSSpec* spec);
 #endif
 
 OSStatus FSPathMakeRef(const uint8_t* path, FSRef* fsref, Boolean* isDirectory)
@@ -342,6 +343,10 @@ OSStatus FSGetCatalogInfo(const FSRef* ref, uint32_t infoBits, FSCatalogInfo* in
 			infoOut->accessDate = Darling::time_tToUTC(st.st_atime);
 	}
 
+#if !__LP64__
+	if (fsspec)
+		return fsSpecForPath(path, fsspec);
+#endif
 	return noErr;
 }
 
@@ -431,7 +436,60 @@ static std::string extractXDGValue(const char* home, const std::string& line)
 	return std::string();
 }
 
-// TODO: Test this function!
+static OSErr fsSpecError(int err)
+{
+	switch (err)
+	{
+		case ENOENT: return fnfErr;
+		case EACCES: case EPERM: return permErr;
+		case EROFS: return wPrErr;
+		case EEXIST: return dupFNErr;
+		default: return makeOSStatus(err);
+	}
+}
+
+// Makes the FSRef of a folder path, creating the folder when asked and it is missing.
+static OSStatus folderRefAtPath(
+    const char* path,Boolean createFolder,FSRef* location)
+{
+    if (!path || !*path || !location)
+        return paramErr;
+
+    struct stat st;
+
+    if (stat(path,&st)!=0) {
+        int error=errno;
+
+        if (!createFolder || error!=ENOENT)
+            return fsSpecError(error);
+
+        if (mkdir(path,0777)!=0 && errno!=EEXIST)
+            return fsSpecError(errno);
+
+        if (stat(path,&st)!=0)
+            return fsSpecError(errno);
+    }
+
+    if (!S_ISDIR(st.st_mode))
+        return dirNFErr;
+
+    FSRef candidate={};
+    Boolean directory=false;
+
+    OSStatus err=FSPathMakeRefWithOptions(
+        (const uint8_t*)path,0,&candidate,&directory);
+
+    if (err!=noErr)
+        return err;
+
+    if (!directory)
+        return dirNFErr;
+
+    *location=candidate;
+
+    return noErr;
+}
+
 OSStatus FSFindFolder(long vRefNum, OSType folderType, Boolean createFolder, FSRef* location)
 {
 	if (folderType == kTemporaryFolderType)
@@ -441,12 +499,7 @@ OSStatus FSFindFolder(long vRefNum, OSType folderType, Boolean createFolder, FSR
 		if (!tmpdir)
 			tmpdir = "/tmp";
 		
-		FSPathMakeRef((const uint8_t*) tmpdir, location, nullptr);
-		
-		if (createFolder && access(tmpdir, F_OK) != 0)
-			mkdir(tmpdir, 0777);
-		
-		return noErr;
+		return folderRefAtPath(tmpdir,createFolder,location);
 	}
 	else if (folderType == kDesktopFolderType || folderType == kSystemDesktopFolderType)
 	{
@@ -455,6 +508,8 @@ OSStatus FSFindFolder(long vRefNum, OSType folderType, Boolean createFolder, FSR
 		std::string line, desktop;
 		const char* home = getenv("HOME");
 		
+		if (!home || !*home)
+			return fnfErr;
 		desktop = home;
 		desktop += "/Desktop";
 	
@@ -473,12 +528,7 @@ OSStatus FSFindFolder(long vRefNum, OSType folderType, Boolean createFolder, FSR
 			}
 		}
 		
-		FSPathMakeRef((const uint8_t*) desktop.c_str(), location, nullptr);
-		
-		if (createFolder && access(desktop.c_str(), F_OK) != 0)
-			mkdir(desktop.c_str(), 0777);
-		
-		return noErr;
+		return folderRefAtPath(desktop.c_str(),createFolder,location);
 	}
 	else
 		return unimpErr;
@@ -1769,18 +1819,6 @@ extern "C" OSStatus FSMoveObjectToTrashSync(const FSRef* source, FSRef* target, 
 // FSSpec: the 32-bit File Manager's name for an item, the volume, the ID of the parent directory
 // and the name of the item. The name is the item's name in the file system, not an HFS name.
 
-static OSErr fsSpecError(int err)
-{
-	switch (err)
-	{
-		case ENOENT: return fnfErr;
-		case EACCES: case EPERM: return permErr;
-		case EROFS: return wPrErr;
-		case EEXIST: return dupFNErr;
-		default: return makeOSStatus(err);
-	}
-}
-
 static std::string fsSpecDirectory(SInt16 vRefNum, SInt32 dirID, bool* ok)
 {
 	std::string path;
@@ -1801,12 +1839,36 @@ static std::string fsSpecDirectory(SInt16 vRefNum, SInt32 dirID, bool* ok)
 	return path;
 }
 
+static bool fsSpecIsRootName(ConstStr255Param name)
+{
+	const size_t length = strlen(kBootVolumeName);
+	return name[0] == length && memcmp(name + 1, kBootVolumeName, length) == 0;
+}
+
+// The root directory of a volume is described by the volume's name, with fsRtParID as its parent.
+static void fillRootFSSpec(FSSpec* spec)
+{
+	const size_t length = strlen(kBootVolumeName);
+
+	memset(spec, 0, sizeof(*spec));
+	spec->vRefNum = kBootVolumeRefNum;
+	spec->parID = fsRtParID;
+	spec->name[0] = (unsigned char) length;
+	memcpy(spec->name + 1, kBootVolumeName, length);
+}
+
 static bool fsSpecPath(const FSSpec* spec, std::string& path)
 {
 	bool ok;
 
 	if (!spec || spec->name[0] == 0 || spec->name[0] > sizeof(spec->name) - 1)
 		return false;
+	if (spec->parID == fsRtParID)
+	{
+		// The volume's name under fsRtParID names the root directory of the volume
+		path = "/";
+		return fsSpecIsRootName(spec->name);
+	}
 	path = fsSpecDirectory(spec->vRefNum, spec->parID, &ok);
 	if (!ok)
 		return false;
@@ -1816,7 +1878,7 @@ static bool fsSpecPath(const FSSpec* spec, std::string& path)
 	return true;
 }
 
-static void fsSpecForPath(const std::string& path, FSSpec* spec)
+static OSErr fsSpecForPath(const std::string& path, FSSpec* spec)
 {
 	size_t slash = path.find_last_of('/');
 	std::string parent = (slash == std::string::npos || slash == 0) ? std::string("/") : path.substr(0, slash);
@@ -1825,13 +1887,21 @@ static void fsSpecForPath(const std::string& path, FSSpec* spec)
 	uint32_t nodeID, parentID;
 
 	memset(spec, 0, sizeof(*spec));
-	if (::stat(parent.c_str(), &st) != 0 || leaf.size() > sizeof(spec->name) - 1)
-		return;
+	if (path == "/")
+	{
+		fillRootFSSpec(spec);
+		return noErr;
+	}
+	if (leaf.empty() || leaf.size() > sizeof(spec->name) - 1)
+		return bdNamErr;
+	if (::stat(parent.c_str(), &st) != 0 || !S_ISDIR(st.st_mode))
+		return dirNFErr;
 	nodeIDsForPath(parent, st, &nodeID, &parentID);
 	spec->vRefNum = kBootVolumeRefNum;
 	spec->parID = parent == "/" ? fsRtDirID : (SInt32) nodeID;
 	spec->name[0] = (unsigned char) leaf.size();
 	memcpy(spec->name + 1, leaf.data(), leaf.size());
+	return noErr;
 }
 
 OSErr FSMakeFSSpec(FSVolumeRefNum vRefNum, SInt32 dirID, ConstStr255Param fileName, FSSpec* spec)
@@ -1844,6 +1914,16 @@ OSErr FSMakeFSSpec(FSVolumeRefNum vRefNum, SInt32 dirID, ConstStr255Param fileNa
 	if (!spec)
 		return paramErr;
 	memset(spec, 0, sizeof(*spec));
+	if (dirID == fsRtParID)
+	{
+		// The parent of the root directory is no directory: the only item it holds, by the volume's
+		// name, is the root directory. Any other name is a volume that does not exist (the same error
+		// PBMakeFSRefSync gives for this ID).
+		if (!fileName || !fsSpecIsRootName(fileName))
+			return nsvErr;
+		fillRootFSSpec(spec);
+		return noErr;
+	}
 	dir = fsSpecDirectory(vRefNum, dirID, &ok);
 	// QUIRK: a directory ID that names no directory gives fnfErr, not dirNFErr. Not documented. Evidence:
 	// black-box observation on macOS 10.14.4 i386 (tier 2).
@@ -1871,6 +1951,12 @@ OSErr FSMakeFSSpec(FSVolumeRefNum vRefNum, SInt32 dirID, ConstStr255Param fileNa
 	std::string parent = (slash == std::string::npos || slash == 0) ? std::string("/") : path.substr(0, slash);
 	std::string leaf = path == "/" ? std::string() : path.substr(slash + 1);
 
+	if (path == "/")
+	{
+		// The root directory itself (fsRtDirID with an empty name)
+		fillRootFSSpec(spec);
+		return noErr;
+	}
 	if (::stat(parent.c_str(), &st) != 0 || !S_ISDIR(st.st_mode))
 		return dirNFErr;
 	if (leaf.size() > sizeof(spec->name) - 1)
@@ -1988,4 +2074,157 @@ OSErr FSpCreate(const FSSpec* spec, OSType creator, OSType fileType, ScriptCode 
 	info.fdCreator = creator;
 	return FSpSetFInfo(spec, &info);
 }
+
+// The classic file access calls: they open a file by FSSpec and read and write at its mark, on the same fork
+// references as FSOpenFork. The permission is that of the File Manager: fsCurPerm opens the fork for reading and
+// writing if the file allows it, and for reading otherwise; fsRdWrShPerm is read and write.
+// Reference: File Manager Reference (Inside Macintosh: Files).
+static OSErr openForkOfSpec(const FSSpec* spec, bool resourceFork, SInt8 permission, FSIORefNum* refNum)
+{
+	std::string path;
+	FSRef ref;
+	HFSUniStr255 forkName;
+
+	if (!refNum)
+		return paramErr;
+	*refNum = 0;
+	if (!fsSpecPath(spec, path))
+		return fnfErr;
+	OSStatus status = FSPathMakeRef((const uint8_t*) path.c_str(), &ref, nullptr);
+	if (status != noErr)
+		return (OSErr) status;
+	if (resourceFork)
+		FSGetResourceForkName(&forkName);
+	else
+		forkName.length = 0;
+	if (resourceFork)
+		permission = fsRdPerm; // the resource fork is held in memory and cannot be written back
+	if (permission == fsRdWrShPerm)
+		permission = fsRdWrPerm;
+	if (permission == fsCurPerm)
+	{
+		OSErr err = FSOpenFork(&ref, forkName.length, forkName.unicode, fsRdWrPerm, refNum);
+		if (err != noErr)
+			err = FSOpenFork(&ref, forkName.length, forkName.unicode, fsRdPerm, refNum);
+		return err;
+	}
+	return FSOpenFork(&ref, forkName.length, forkName.unicode, permission, refNum);
+}
+
+OSErr FSpOpenDF(const FSSpec* spec, SInt8 permission, FSIORefNum* refNum)
+{
+	return openForkOfSpec(spec, false, permission, refNum);
+}
+
+OSErr FSpOpenRF(const FSSpec* spec, SInt8 permission, FSIORefNum* refNum)
+{
+	return openForkOfSpec(spec, true, permission, refNum);
+}
+
+// Reads *count bytes at the mark and sets *count to the number read; reaching the end first is eofErr
+OSErr FSRead(FSIORefNum refNum, long* count, void* buffPtr)
+{
+	ByteCount actual = 0;
+
+	if (!count || *count < 0)
+		return paramErr;
+	OSErr err = FSReadFork(refNum, fsAtMark, 0, (ByteCount) *count, buffPtr, &actual);
+	*count = (long) actual;
+	return err;
+}
+
+OSErr FSWrite(FSIORefNum refNum, long* count, const void* buffPtr)
+{
+	ByteCount actual = 0;
+
+	if (!count || *count < 0)
+		return paramErr;
+	OSErr err = FSWriteFork(refNum, fsAtMark, 0, (ByteCount) *count, buffPtr, &actual);
+	*count = (long) actual;
+	return err;
+}
+
+OSErr GetEOF(FSIORefNum refNum, long* logEOF)
+{
+	SInt64 size;
+
+	if (!logEOF)
+		return paramErr;
+	OSErr err = FSGetForkSize(refNum, &size);
+	if (err == noErr)
+		*logEOF = (long) size;
+	return err;
+}
+
+OSErr SetEOF(FSIORefNum refNum, long logEOF)
+{
+	return FSSetForkSize(refNum, fsFromStart, logEOF);
+}
+
+OSErr GetFPos(FSIORefNum refNum, long* filePos)
+{
+	SInt64 position;
+
+	if (!filePos)
+		return paramErr;
+	OSErr err = FSGetForkPosition(refNum, &position);
+	if (err == noErr)
+		*filePos = (long) position;
+	return err;
+}
+
+OSErr FSClose(FSIORefNum refNum)
+{
+	return FSCloseFork(refNum);
+}
+#endif
+
+#ifndef __LP64__
+#include <stdint.h>
+#include <CoreServices/FileManager.h>
+
+#ifdef __cplusplus
+extern "C"
+#endif
+OSErr FindFolder(
+    short volume,OSType folderType,
+    Boolean createFolder,
+    short* foundVolume,long* foundDirectory)
+{
+    if (!foundVolume || !foundDirectory)
+        return paramErr;
+
+    FSRef ref;
+
+    OSStatus err=FSFindFolder(
+        volume,folderType,createFolder,&ref);
+
+    if (err!=noErr)
+        return err>=-32768 && err<=32767
+            ? (OSErr)err : ioErr;
+
+    FSCatalogInfo info={0};
+
+    err=FSGetCatalogInfo(
+        &ref,
+        kFSCatInfoVolume |
+        kFSCatInfoNodeID |
+        kFSCatInfoNodeFlags,
+        &info,0,0,0);
+
+    if (err!=noErr)
+        return err>=-32768 && err<=32767
+            ? (OSErr)err : ioErr;
+
+    if (!(info.nodeFlags & kFSNodeIsDirectoryMask))
+        return dirNFErr;
+
+    *foundVolume=info.volume;
+
+    // Preserve the legacy 32-bit catalog identifier.
+    *foundDirectory=(long)(int32_t)info.nodeID;
+
+    return noErr;
+}
+
 #endif

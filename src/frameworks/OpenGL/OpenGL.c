@@ -688,6 +688,7 @@ struct _CGLContextObject {
     // so we need to save the last set value. The default is 0.
     // This is the application's value; a paced context never gives it to EGL.
     int swap_interval;
+    int surface_opacity;
     int paced;
     struct cgl_swap_pacer pacer;
     CGLPixelFormatObj pixel_format;
@@ -1900,6 +1901,56 @@ CGLError CGLSetFullScreen(CGLContextObj ctx) {
     return setFullScreen(ctx, 1, 0);
 }
 
+// A pixel format that asks for no alpha channel gets, on Wayland, an EGL config without one: the buffers of such a
+// window are then XRGB, which the compositor shows opaque, where ARGB buffers with an alpha below one are blended
+// with what is behind the window (as a compositor that takes the alpha as premultiplied does). Other platforms
+// ignore the destination alpha of a window, and keep the registered config.
+static int attributes_want_alpha(const CGLPixelFormatAttribute *attrs) {
+    for (int i = 0; attrs[i] != 0; i++) {
+        if (attrs[i] == kCGLPFAAlphaSize)
+            return attrs[i + 1] > 0;
+        if (attribute_has_argument(attrs[i]))
+            i++;
+    }
+    return 0;
+}
+
+static EGLBoolean choose_opaque_config(EGLDisplay dpy, EGLConfig *out_config) {
+    EGLint const attrs[] = {
+        EGL_RED_SIZE, 8,
+        EGL_GREEN_SIZE, 8,
+        EGL_BLUE_SIZE, 8,
+        EGL_DEPTH_SIZE, 16,
+        EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
+        EGL_RENDERABLE_TYPE, EGL_OPENGL_BIT,
+        EGL_NONE
+    };
+    EGLint count = 0;
+    if (!p_eglChooseConfig(dpy, attrs, NULL, 0, &count) || count <= 0)
+        return EGL_FALSE;
+    EGLConfig *configs = calloc((size_t)count, sizeof(*configs));
+    if (!configs)
+        return EGL_FALSE;
+    EGLBoolean found = EGL_FALSE;
+    if (p_eglChooseConfig(dpy, attrs, configs, count, &count)) {
+        // one that also makes pbuffers (the surface of a context before it has a drawable) is better than a window-only one
+        for (int need_pbuffer = 1; need_pbuffer >= 0 && !found; need_pbuffer--) {
+            for (EGLint i = 0; i < count; i++) {
+                EGLint alpha = 1, surface_types = 0;
+                p_eglGetConfigAttrib(dpy, configs[i], EGL_ALPHA_SIZE, &alpha);
+                p_eglGetConfigAttrib(dpy, configs[i], EGL_SURFACE_TYPE, &surface_types);
+                if (alpha == 0 && (!need_pbuffer || (surface_types & EGL_PBUFFER_BIT))) {
+                    *out_config = configs[i];
+                    found = EGL_TRUE;
+                    break;
+                }
+            }
+        }
+    }
+    free(configs);
+    return found;
+}
+
 CGLError CGLChoosePixelFormat(
     const CGLPixelFormatAttribute *attrs,
     CGLPixelFormatObj *result,
@@ -1924,7 +1975,13 @@ CGLError CGLChoosePixelFormat(
     format->egl_config = config;
     format->swap_interval = default_swap_interval;
     format->paced = default_paced;
+    EGLenum platform_of_format = registered_platform;
     pthread_mutex_unlock(&registration_lock);
+    if (platform_of_format == EGL_PLATFORM_WAYLAND_KHR && format->egl_display != EGL_NO_DISPLAY && !attributes_want_alpha(attrs)) {
+        EGLConfig opaque;
+        if (choose_opaque_config(format->egl_display, &opaque))
+            format->egl_config = opaque;
+    }
     format->retain_count = 1;
     format->attributes = malloc(sizeof(CGLPixelFormatAttribute) * (count + 1));
     if (!format->attributes) {
@@ -2164,6 +2221,7 @@ static CGLError createContext(CGLPixelFormatObj pixelFormat, CGLContextObj share
     context->fullscreen_surface = EGL_NO_SURFACE;
     context->set_surface = EGL_NO_SURFACE;
     context->swap_interval = interval;
+    context->surface_opacity = 1;
     context->paced = paced;
     context->pacer.period_ns = cgl_period_ns_from_millihertz(0);
     context->pacer.last_ns = 0;
@@ -4773,6 +4831,11 @@ CGLError CGLSetParameter(CGLContextObj context, CGLContextParameter parameter, c
             context->swap_interval = v;
         return success ? kCGLNoError : kCGLBadValue;
     }
+    if (parameter == kCGLCPSurfaceOpacity)
+    {
+        context->surface_opacity = (*value != 0) ? 1 : 0;
+        return kCGLNoError;
+    }
     // 280 and 284 size internal function caches of the original implementation
     // (set by SDL 1.2, among others); they have no observable effect here.
     if (parameter == 280 || parameter == 284)
@@ -4790,6 +4853,11 @@ CGLError CGLGetParameter(CGLContextObj context, CGLContextParameter parameter, G
     if (parameter == kCGLCPSwapInterval)
     {
         *value = context->swap_interval;
+        return kCGLNoError;
+    }
+    if (parameter == kCGLCPSurfaceOpacity)
+    {
+        *value = context->surface_opacity;
         return kCGLNoError;
     }
     fprintf(stderr, "CGLGetParameter unimplemented for parameter %d\n", parameter);

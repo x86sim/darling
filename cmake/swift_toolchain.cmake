@@ -22,6 +22,8 @@
 
 set(SWIFT_TOOLCHAIN "" CACHE STRING
 	"Swift toolchain used to build the Swift SDK overlays (root directory, empty to auto-detect, OFF to skip)")
+# Explicit executable takes precedence over automatic root/PATH search; OFF still disables overlays.
+set(SWIFT_COMPILER_EXECUTABLE "" CACHE FILEPATH "Explicit host Swift compiler/legacy driver executable")
 set(SWIFT_TOOLCHAIN_MIN_VERSION "6.3" CACHE INTERNAL "Oldest Swift compiler that can read the shipped stdlib interfaces")
 
 set(SWIFT_TOOLCHAIN_FOUND FALSE)
@@ -40,24 +42,54 @@ endmacro()
 if (SWIFT_TOOLCHAIN MATCHES "^(OFF|NO|FALSE|0|N)$")
 	_swift_toolchain_skip("disabled by SWIFT_TOOLCHAIN=${SWIFT_TOOLCHAIN}")
 else()
-	# find_program caches its result; a changed SWIFT_TOOLCHAIN must search again.
-	if (NOT "${SWIFT_TOOLCHAIN}" STREQUAL "${_SWIFT_TOOLCHAIN_SEARCHED_FOR}")
-		unset(SWIFT_COMPILER CACHE)
-	endif()
-	set(_SWIFT_TOOLCHAIN_SEARCHED_FOR "${SWIFT_TOOLCHAIN}" CACHE INTERNAL "")
-
-	if (SWIFT_TOOLCHAIN)
-		find_program(SWIFT_COMPILER NAMES swiftc
-			PATHS "${SWIFT_TOOLCHAIN}/usr/bin" "${SWIFT_TOOLCHAIN}/bin"
-			NO_DEFAULT_PATH)
+	if (SWIFT_COMPILER_EXECUTABLE)
+		if (NOT IS_ABSOLUTE "${SWIFT_COMPILER_EXECUTABLE}" OR
+			NOT EXISTS "${SWIFT_COMPILER_EXECUTABLE}" OR IS_DIRECTORY "${SWIFT_COMPILER_EXECUTABLE}")
+			message(FATAL_ERROR "SWIFT_COMPILER_EXECUTABLE must be an absolute existing file")
+		endif()
+		set(SWIFT_COMPILER "${SWIFT_COMPILER_EXECUTABLE}")
 	else()
-		file(GLOB _swift_candidates "/opt/swift-*/usr/bin" "/usr/local/swift*/usr/bin")
-		list(SORT _swift_candidates)
-		list(REVERSE _swift_candidates)
-		find_program(SWIFT_COMPILER NAMES swiftc
-			HINTS ENV SWIFT_TOOLCHAIN
-			PATHS ${_swift_candidates})
-		unset(_swift_candidates)
+		# find_program caches its result; a changed SWIFT_TOOLCHAIN must search again.
+		if (NOT "${SWIFT_TOOLCHAIN}" STREQUAL "${_SWIFT_TOOLCHAIN_SEARCHED_FOR}")
+			unset(SWIFT_COMPILER CACHE)
+		endif()
+		set(_SWIFT_TOOLCHAIN_SEARCHED_FOR "${SWIFT_TOOLCHAIN}" CACHE INTERNAL "")
+
+		if (SWIFT_TOOLCHAIN)
+			find_program(SWIFT_COMPILER NAMES swiftc
+				PATHS "${SWIFT_TOOLCHAIN}/usr/bin" "${SWIFT_TOOLCHAIN}/bin"
+				NO_DEFAULT_PATH)
+		else()
+			file(GLOB _swift_candidates "/opt/swift-*/usr/bin" "/usr/local/swift*/usr/bin")
+			list(SORT _swift_candidates)
+			list(REVERSE _swift_candidates)
+			find_program(SWIFT_COMPILER NAMES swiftc
+				HINTS ENV SWIFT_TOOLCHAIN
+				PATHS ${_swift_candidates})
+			unset(_swift_candidates)
+		endif()
+	endif()
+
+	if (SWIFT_COMPILER)
+		get_filename_component(_swift_proxy "${SWIFT_COMPILER}" REALPATH)
+		get_filename_component(_swift_proxy_name "${_swift_proxy}" NAME)
+		if (_swift_proxy_name STREQUAL "swiftly")
+			# Swiftly's swiftc is a proxy, not a compiler in the selected toolchain.
+			# Resolve it before checking the compiler version and its resources.
+			execute_process(COMMAND "${_swift_proxy}" use --print-location
+				RESULT_VARIABLE _swiftly_rc OUTPUT_VARIABLE _swiftly_root
+				ERROR_QUIET OUTPUT_STRIP_TRAILING_WHITESPACE)
+			if (_swiftly_rc EQUAL 0 AND NOT "${_swiftly_root}" STREQUAL "")
+				# Keep the proxy in the cache so the selection is resolved again on reconfigure.
+				set(SWIFT_COMPILER "${_swiftly_root}/usr/bin/swiftc")
+			else()
+				set(SWIFT_COMPILER "SWIFT_COMPILER-NOTFOUND")
+			endif()
+			unset(_swiftly_rc)
+			unset(_swiftly_root)
+		endif()
+		unset(_swift_proxy)
+		unset(_swift_proxy_name)
 	endif()
 
 	if (NOT SWIFT_COMPILER)

@@ -139,4 +139,5 @@ void elfcalls_make(struct elf_calls* calls)
 	calls->native_fork = __mldr_native_fork;
 
 	calls->inherited_nofile_limit = __mldr_inherited_nofile_limit;
+	calls->postfork_child = __mldr_socket_bitmap_postfork_child;
 }

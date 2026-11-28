@@ -272,6 +272,9 @@ enable_testing()
 # Tests of the install and packaging scripts; they need no Darling build
 find_package(Python3 QUIET COMPONENTS Interpreter)
 if (Python3_Interpreter_FOUND)
+	add_test(NAME swift_toolchain
+		COMMAND ${CMAKE_COMMAND} -E env "CMAKE=${CMAKE_COMMAND}"
+			${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/swift-toolchain.py)
 	add_test(NAME install_symlink
 		COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/install-symlink.py)
 	add_test(NAME android_layout
@@ -288,6 +291,9 @@ if (Python3_Interpreter_FOUND)
 	set_tests_properties(rpm_packaging PROPERTIES SKIP_RETURN_CODE 77)
 	add_test(NAME target_conditionals
 		COMMAND sh ${CMAKE_SOURCE_DIR}/tests/headers/target-conditionals.sh ${CMAKE_SOURCE_DIR})
+	add_test(NAME carboncore_folders_header
+		COMMAND sh ${CMAKE_SOURCE_DIR}/tests/headers/carboncore-folders-header.sh
+			${CMAKE_SOURCE_DIR}/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk)
 endif()
 
 # Host-side unit tests, run with ctest from the build directory

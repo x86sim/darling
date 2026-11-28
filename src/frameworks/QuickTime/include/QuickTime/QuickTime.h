@@ -22,6 +22,10 @@
 #define _QuickTime_H_
 
 #include <MacTypes.h>
+#include <QuickTime/ImageCompression.h>
+#if !__LP64__
+#include <CarbonCore/Files.h>
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -32,6 +36,37 @@ extern "C" {
  * long parameters and results below as 32 bits on i386; SInt32 keeps that
  * width on x86_64. */
 typedef struct MovieType **Movie;
+
+#if !__LP64__
+typedef struct PointerDataRefRecord {
+    void *data;
+    Size dataLength;
+} PointerDataRefRecord;
+
+typedef PointerDataRefRecord *PointerDataRefPtr;
+
+enum { movieInDataForkResID = -1 };
+
+OSErr NewMovieFromFile(Movie *theMovie, short resRefNum,
+                      short *resId, Str255 resName,
+                      short newMovieFlags,
+                      Boolean *dataRefWasChanged);
+
+enum { PointerDataHandlerSubType = 0x70747220 };
+
+typedef struct TrackType **Track;
+typedef struct MediaType **Media;
+
+SInt32 GetMovieTrackCount(Movie movie);
+Track GetMovieIndTrack(Movie movie, SInt32 index);
+Media GetTrackMedia(Track track);
+TimeScale GetMediaTimeScale(Media media);
+SInt32 GetMediaSampleCount(Media media);
+
+/* Read-only pointer references; metadata only. */
+OSErr NewMovieFromDataRef(Movie *m, short flags, short *id,
+                          Handle dataRef, OSType dataRefType);
+#endif
 
 OSErr EnterMovies(void);
 void ExitMovies(void);
@@ -45,6 +80,13 @@ void SetMovieTimeScale(Movie theMovie, TimeScale timeScale);
 TimeValue GetMovieDuration(Movie theMovie);
 /* currentTime must be NULL: time bases are not implemented. */
 TimeValue GetMovieTime(Movie theMovie, TimeRecord *currentTime);
+
+#if !__LP64__
+/* Read-only movie file access. */
+OSErr OpenMovieFile(const FSSpec *fileSpec, short *resRefNum, SInt8 permission);
+OSErr CloseMovieFile(short resRefNum);
+#endif
+
 
 #ifdef __cplusplus
 }
@@ -239,7 +281,9 @@ void* ClockTimeChanged(void);
 void* ClockUpdateSoundSamples64(void);
 void* ClockUpdateSoundSamplesAndTimeStamp(void);
 void* CloneRgn(void);
+#if __LP64__
 void* CloseMovieFile(void);
+#endif
 void* CloseMovieStorage(void);
 void* ClosedCaptionGetCCData(void);
 void* ClosedCaptionGetRawText(void);
@@ -275,7 +319,6 @@ void* CompressPicture(void);
 void* CompressPictureFile(void);
 void* CompressSequenceBegin(void);
 void* CompressSequenceFrame(void);
-void* ConcatMatrix(void);
 void* ControlDown(void);
 void* ConvertDataRefToMovieDataRef(void);
 void* ConvertFileToMovieFile(void);
@@ -691,8 +734,6 @@ void* GetFirstCallBack(void);
 void* GetFixedSizeAtom(void);
 void* GetGraphicsImporterForDataRef(void);
 void* GetGraphicsImporterForDataRefWithFlags(void);
-void* GetGraphicsImporterForFile(void);
-void* GetGraphicsImporterForFileWithFlags(void);
 void* GetHandleAtom(void);
 void* GetHandlerAtom(void);
 void* GetImageDescriptionCTable(void);
@@ -733,7 +774,9 @@ void* GetMediaPropertyAtom(void);
 void* GetMediaQuality(void);
 void* GetMediaSample(void);
 void* GetMediaSample2(void);
+#if __LP64__
 void* GetMediaSampleCount(void);
+#endif
 void* GetMediaSampleDescription(void);
 void* GetMediaSampleDescriptionCount(void);
 void* GetMediaSampleReference(void);
@@ -742,7 +785,9 @@ void* GetMediaSampleReferences64(void);
 void* GetMediaSeed(void);
 void* GetMediaShadowSync(void);
 void* GetMediaSyncSampleCount(void);
+#if __LP64__
 void* GetMediaTimeScale(void);
+#endif
 void* GetMediaTrack(void);
 void* GetMediaUserData(void);
 void* GetMovieActive(void);
@@ -774,7 +819,9 @@ void* GetMovieEffectiveRate(void);
 void* GetMovieGWorld(void);
 void* GetMovieIdleManager(void);
 void* GetMovieImporterForDataRef(void);
+#if __LP64__
 void* GetMovieIndTrack(void);
+#endif
 void* GetMovieIndTrackType(void);
 void* GetMovieLoadState(void);
 void* GetMovieMatrix(void);
@@ -802,7 +849,9 @@ void* GetMovieStatus(void);
 void* GetMovieThreadAttachState(void);
 void* GetMovieTimeBase(void);
 void* GetMovieTrack(void);
+#if __LP64__
 void* GetMovieTrackCount(void);
+#endif
 void* GetMovieUserData(void);
 void* GetMovieVisualBrightness(void);
 void* GetMovieVisualContext(void);
@@ -875,7 +924,9 @@ void* GetTrackLayer(void);
 void* GetTrackLoadSettings(void);
 void* GetTrackMatrix(void);
 void* GetTrackMatte(void);
+#if __LP64__
 void* GetTrackMedia(void);
+#endif
 void* GetTrackModificationTime(void);
 void* GetTrackMovie(void);
 void* GetTrackMovieBoundsRgn(void);
@@ -990,13 +1041,11 @@ void* GraphicsImportCreateCGImage(void);
 void* GraphicsImportDoExportImageFileDialog(void);
 void* GraphicsImportDoExportImageFileToDataRefDialog(void);
 void* GraphicsImportDoesDrawAllPixels(void);
-void* GraphicsImportDraw(void);
 void* GraphicsImportExportImageFile(void);
 void* GraphicsImportExportImageFileToDataRef(void);
 void* GraphicsImportGetAliasedDataReference(void);
 void* GraphicsImportGetAsPicture(void);
 void* GraphicsImportGetBaseDataOffsetAndSize64(void);
-void* GraphicsImportGetBoundsRect(void);
 void* GraphicsImportGetClip(void);
 void* GraphicsImportGetColorSyncProfile(void);
 void* GraphicsImportGetDataFile(void);
@@ -1015,20 +1064,15 @@ void* GraphicsImportGetDestinationColorSyncProfileRef(void);
 void* GraphicsImportGetExportImageTypeList(void);
 void* GraphicsImportGetExportSettingsAsAtomContainer(void);
 void* GraphicsImportGetFlags(void);
-void* GraphicsImportGetGWorld(void);
 void* GraphicsImportGetGenericColorSyncProfile(void);
 void* GraphicsImportGetGraphicsMode(void);
 void* GraphicsImportGetImageCount(void);
-void* GraphicsImportGetImageDescription(void);
 void* GraphicsImportGetImageIndex(void);
 void* GraphicsImportGetMIMETypeList(void);
-void* GraphicsImportGetMatrix(void);
 void* GraphicsImportGetMetaData(void);
-void* GraphicsImportGetNaturalBounds(void);
 void* GraphicsImportGetOverrideSourceColorSyncProfileRef(void);
 void* GraphicsImportGetPlaybackTimeHints(void);
 void* GraphicsImportGetProgressProc(void);
-void* GraphicsImportGetQuality(void);
 void* GraphicsImportGetReturnGenericColorSyncProfile(void);
 void* GraphicsImportGetSourceRect(void);
 void* GraphicsImportReadData(void);
@@ -1037,9 +1081,7 @@ void* GraphicsImportSaveAsPicture(void);
 void* GraphicsImportSaveAsPictureToDataRef(void);
 void* GraphicsImportSaveAsQuickTimeImageFile(void);
 void* GraphicsImportSaveAsQuickTimeImageFileToDataRef(void);
-void* GraphicsImportSetBoundsRect(void);
 void* GraphicsImportSetClip(void);
-void* GraphicsImportSetDataFile(void);
 void* GraphicsImportSetDataHandle(void);
 void* GraphicsImportSetDataReference(void);
 void* GraphicsImportSetDataReferenceOffsetAndLimit(void);
@@ -1048,15 +1090,12 @@ void* GraphicsImportSetDestRect(void);
 void* GraphicsImportSetDestinationColorSyncProfileRef(void);
 void* GraphicsImportSetExportSettingsFromAtomContainer(void);
 void* GraphicsImportSetFlags(void);
-void* GraphicsImportSetGWorld(void);
 void* GraphicsImportSetGraphicsMode(void);
 void* GraphicsImportSetImageIndex(void);
 void* GraphicsImportSetImageIndexToThumbnail(void);
-void* GraphicsImportSetMatrix(void);
 void* GraphicsImportSetOverrideSourceColorSyncProfileRef(void);
 void* GraphicsImportSetPlaybackTimeHints(void);
 void* GraphicsImportSetProgressProc(void);
-void* GraphicsImportSetQuality(void);
 void* GraphicsImportSetReturnGenericColorSyncProfile(void);
 void* GraphicsImportSetSourceRect(void);
 void* GraphicsImportValidate(void);
@@ -2211,8 +2250,12 @@ void* NewMovieExportStageReachedCallbackUPP(void);
 void* NewMovieForDataRefFromHandle(void);
 void* NewMovieFromDataFork(void);
 void* NewMovieFromDataFork64(void);
+#if __LP64__
 void* NewMovieFromDataRef(void);
+#endif
+#if __LP64__
 void* NewMovieFromFile(void);
+#endif
 void* NewMovieFromHandle(void);
 void* NewMovieFromProperties(void);
 void* NewMovieFromScrap(void);
@@ -2321,7 +2364,9 @@ void* NewVdigIntUPP(void);
 void* NewYUVPtrsUPP(void);
 void* OpenADataHandler(void);
 void* OpenADataHandler2(void);
+#if __LP64__
 void* OpenMovieFile(void);
+#endif
 void* OpenMovieFileUnicode(void);
 void* OpenMovieStorage(void);
 void* OpenPreviewComponentForFile(void);
@@ -2889,7 +2934,6 @@ void* QTNewDataReferenceWithDirectoryCFString(void);
 void* QTNewDataReferenceWithDirectoryUnicode(void);
 void* QTNewEmptyHandle(void);
 void* QTNewGWorld(void);
-void* QTNewGWorldFromPtr(void);
 void* QTNewHandle(void);
 void* QTNewHandleClear(void);
 void* QTNewObjectSpecifier(void);
@@ -3823,7 +3867,6 @@ void* RTPRssmSetPayloadHeaderLength(void);
 void* RTPRssmSetSampleDescription(void);
 void* RTPRssmSetStreamHandler(void);
 void* RTPRssmSetTimeScale(void);
-void* RectMatrix(void);
 void* ReleaseQuickTimePreferences(void);
 void* ReleaseQuickTimePreferencesForReading(void);
 void* ReleaseQuickTimePreferencesForWriting(void);
@@ -4136,7 +4179,6 @@ void* SSMusicValidateAtomicInstrument(void);
 void* SampleNumToMediaDecodeTime(void);
 void* SampleNumToMediaDisplayTime(void);
 void* SampleNumToMediaTime(void);
-void* ScaleMatrix(void);
 void* ScaleMovieSegment(void);
 void* ScaleTrackSegment(void);
 void* ScalingCodecClientGetBlitterProc(void);
@@ -4178,7 +4220,6 @@ void* SetDSequenceNonScheduledDisplayTime(void);
 void* SetDSequenceSrcRect(void);
 void* SetDSequenceTimeCode(void);
 void* SetDSequenceTransferMode(void);
-void* SetIdentityMatrix(void);
 void* SetImageDescriptionCTable(void);
 void* SetMediaBoundaryTimes(void);
 void* SetMediaDataHandler(void);
@@ -4385,7 +4426,6 @@ void* TransformFixedRect(void);
 void* TransformPoints(void);
 void* TransformRect(void);
 void* TransformRgn(void);
-void* TranslateMatrix(void);
 void* TranslateMatrixTo(void);
 void* TrimImage(void);
 void* TuneFlush(void);

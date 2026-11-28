@@ -475,7 +475,7 @@
 	branch = v1.20
 [submodule "src/external/lsof"]
 	path = src/external/lsof
-	url = ../darling-lsof.git
+	url = https://github.com/x86sim/darling-lsof.git
 [submodule "src/external/WebKit"]
 	path = src/external/WebKit
 	url = https://github.com/x86sim/darling-webkit.git

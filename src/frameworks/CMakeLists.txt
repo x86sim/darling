@@ -1,5 +1,11 @@
 project(frameworks)
 
+if (COMPONENT_core)
+	set(CMAKE_INSTALL_DEFAULT_COMPONENT_NAME "core")
+
+	add_subdirectory(System)
+endif()
+
 if (COMPONENT_system)
 	set(CMAKE_INSTALL_DEFAULT_COMPONENT_NAME "system")
 
@@ -99,6 +105,8 @@ if (COMPONENT_gui)
 	add_subdirectory(UIKit)
 	# iOS's OpenGL ES is the host's (EGL and GLES), reached through mldr.
 	add_subdirectory(OpenGLES)
+	# OpenCL uses the host's ICD loader, reached through mldr.
+	add_subdirectory(OpenCL)
 endif()
 
 # this is for all the other stubbed frameworks
@@ -149,7 +157,6 @@ if (COMPONENT_gui_stubs)
 	add_subdirectory(MultipeerConnectivity)
 	add_subdirectory(NotificationCenter)
 	add_subdirectory(OpenAL)
-	add_subdirectory(OpenCL)
 	add_subdirectory(Photos)
 	add_subdirectory(PreferencePanes)
 	add_subdirectory(PDFKit)

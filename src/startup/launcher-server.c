@@ -428,7 +428,7 @@ int launcherFindPrefixServer(const char* procPath, const char* prefix, uid_t uid
 			// EACCES/EPERM: a server of another user namespace (the userns mode's launcher runs as root of its own
 			// namespace, where every server of the same real user matches the uid above, but only those of its own
 			// namespace may be inspected). It is not one this launcher could join, and refusing here kept a userns
-			// container from starting while any other x86Sim container (a system-mode phone) ran.
+			// container from starting while any other Darling container (another container) ran.
 			if (errno == ENOENT || errno == ESRCH || errno == EACCES || errno == EPERM)
 				continue;
 			goto error;

@@ -98,5 +98,26 @@ VT_EXPORT CFStringRef const kVTProfileLevel_HEVC_Main10_AutoLevel;
 
 // CFData, 24 bytes (the layout of the mastering display colour volume format description extension).
 VT_EXPORT CFStringRef const kVTCompressionPropertyKey_MasteringDisplayColorVolume;
+VT_EXPORT CFStringRef const kVTCompressionPropertyKey_CameraCalibrationDataLensCollection;
+VT_EXPORT CFStringRef const kVTCompressionPropertyKey_HDRMetadataInsertionMode;
+VT_EXPORT CFStringRef const kVTCompressionPropertyKey_HorizontalFieldOfView;
+VT_EXPORT CFStringRef const kVTCompressionPropertyKey_ProjectionKind;
+VT_EXPORT CFStringRef const kVTHDRMetadataInsertionMode_None;
+VT_EXPORT CFStringRef const kVTProjectionKind_Equirectangular;
+
+// CFNumber, bits per second. Valid only for encoders that support constant bit rate.
+VT_EXPORT CFStringRef const kVTCompressionPropertyKey_ConstantBitRate;
+
+// CFNumber, spatial QP adaptation level.
+VT_EXPORT CFStringRef const kVTCompressionPropertyKey_SpatialAdaptiveQPLevel;
+
+enum
+{
+	kVTQPModulationLevel_Default = -1,
+	kVTQPModulationLevel_Disable = 0,
+};
+
+// CFData, the content light level information from the format description.
+VT_EXPORT CFStringRef const kVTCompressionPropertyKey_ContentLightLevelInfo;
 
 #endif

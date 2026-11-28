@@ -1,5 +1,4 @@
 project(ScreenCaptureKit)
-
 remove_sdk_framework(ScreenCaptureKit)
 
 set(DYLIB_COMPAT_VERSION "1.0.0")
@@ -26,4 +25,8 @@ add_framework(ScreenCaptureKit
         system
         objc
         Foundation
+        CoreGraphics
+        CoreMedia
+        CoreVideo
+        IOSurface
 )
